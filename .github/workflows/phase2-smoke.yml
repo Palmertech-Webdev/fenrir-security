@@ -144,11 +144,22 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -File agent/windows/tests/SystemProfileShapeTests.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoProfile -File agent/windows/tests/ActiveDirectorySnapshotTests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoProfile -File agent/windows/tests/ActiveDirectoryOpsTests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoProfile -File agent/windows/tests/PatchScriptSyntaxTests.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build Windows native installer and bundled service
         shell: pwsh
         run: cmake --build build --config Release --target antivirus-setup
+      - name: Signature rules need every marker of a ransomware chain (no BlackCat verdict on browsers)
+        shell: pwsh
+        run: powershell.exe -NoProfile -File agent/windows/tests/SignatureRuleMatchTests.ps1
+      - name: Clean-software false-positive suite (installed signed software on the runner)
+        shell: pwsh
+        timeout-minutes: 16
+        run: powershell.exe -NoProfile -File agent/windows/tests/CleanSoftwareFalsePositiveTests.ps1
       - name: Verify unsigned binaries and their trusted build digests
         shell: pwsh
         run: |

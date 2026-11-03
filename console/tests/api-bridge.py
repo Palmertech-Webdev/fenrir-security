@@ -42,6 +42,33 @@ provider_rows = {
     "licenses": [{"skuId": "00000000-0000-0000-0000-000000000030", "skuPartNumber": "Test licence", "consumedUnits": 1, "prepaidUnits": {"enabled": 2}}],
 }
 microsoft.inventory = lambda connection, collection: provider_rows[collection]
+from fenrir_cloud import m365_exchange as exchange  # noqa: E402  (Exchange Online, with rows shaped as Microsoft returns them)
+
+exchange.mailboxes = lambda connection: [{"id": "mbx-1", "displayName": "Render User", "address": "render@example.test", "type": "user",
+                                          "aliases": [], "forwardingTo": None, "forwardingKeepsCopy": False, "hiddenFromAddressBook": False,
+                                          "litigationHold": False, "userPrincipalName": "render@example.test"}]
+exchange.mailbox_detail = lambda connection, identity: {"mailbox": exchange.mailboxes(connection)[0], "fullAccess": [], "sendAs": [], "rules": []}
+exchange.distribution_groups = lambda connection: []
+exchange.group_members = lambda connection, group: []
+exchange.quarantine = lambda connection: []
+exchange.message_trace = lambda connection, sender="", recipient="", days=2: []
+from fenrir_cloud import m365_intune as intune  # noqa: E402
+
+intune.devices = lambda connection: []
+intune.policies = lambda connection: {"compliance": [], "configuration": []}
+intune.apps = lambda connection: []
+intune.autopilot = lambda connection: []
+from fenrir_cloud import m365_collaboration as collaboration  # noqa: E402
+
+collaboration.teams = lambda connection: []
+collaboration.sites = lambda connection: []
+collaboration.sharing_settings = lambda connection: {"sharingCapability": "externalUserSharingOnly", "label": "Guests sign in",
+                                                     "isResharingByExternalUsersEnabled": False, "sharingAllowedDomainList": [],
+                                                     "sharingBlockedDomainList": []}
+from fenrir_cloud import m365_reports as reports_module  # noqa: E402
+
+reports_module.build = lambda connection, key: {"report": key, "title": key, "generatedAt": "2026-01-01T00:00:00Z",
+                                                 "columns": ["name"], "rows": [{"name": "Render"}], "summary": "1 row."}
 with TestClient(create_app(settings), raise_server_exceptions=False) as client:
     token = client.post("/api/console/auth/login", json={"email": "admin@fenrir.local", "password": settings.bootstrap_admin_password}).json()["token"]
     admin = {"Authorization": f"Bearer {token}"}
@@ -71,8 +98,9 @@ with TestClient(create_app(settings), raise_server_exceptions=False) as client:
     with db.session_factory()() as session:
         incident = Incident(tenant_id=tenant["id"], device_id=device_id, title="Console smoke incident")
         session.add(incident)
-        session.add(M365Connection(tenant_id=tenant["id"], name="Test Microsoft tenant", directory_id="00000000-0000-0000-0000-000000000001",
-                                  client_id="00000000-0000-0000-0000-000000000002", credentials_envelope={}))
+        m365_connection = M365Connection(tenant_id=tenant["id"], name="Test Microsoft tenant", directory_id="00000000-0000-0000-0000-000000000001",
+                                         client_id="00000000-0000-0000-0000-000000000002", credentials_envelope={})
+        session.add(m365_connection)
         content = b"FENREC1\n"
         (settings.artifact_dir / "test-recording").write_bytes(content)
         recording = DeviceArtifact(tenant_id=tenant["id"], device_id=device_id, command_id="test-command", kind="remote.recording",
@@ -80,6 +108,7 @@ with TestClient(create_app(settings), raise_server_exceptions=False) as client:
         session.add(recording)
         session.commit()
         incident_id = incident.id
+        m365_id = m365_connection.id
         recording_id = recording.id
     programme = post("/api/console/grc/programmes", {"tenantId": tenant["id"], "frameworkKey": "nist-csf-2"})
     policies = client.get("/api/console/grc/policies", headers=admin).json()
@@ -95,7 +124,7 @@ with TestClient(create_app(settings), raise_server_exceptions=False) as client:
     reply({"ready": True, "me": me, "ids": {"device": device_id, "tenant": tenant["id"], "policy": tenant["defaultPolicyId"],
           "ticket": ticket["id"], "project": project["id"], "incident": incident_id,
           "grcPolicy": policies[0]["id"] if policies else "missing", "framework": "nist-csf-2", "remote": remote["id"],
-          "phone": phone["deviceId"], "recording": recording_id,
+          "phone": phone["deviceId"], "recording": recording_id, "m365": m365_id,
           "cancellationDevice": cancellation_device["deviceId"], "cancellationJob": cancellation_job["id"]}})
     for line in sys.stdin:
         request = json.loads(line)

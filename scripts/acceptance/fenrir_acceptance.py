@@ -551,6 +551,25 @@ def backstage_desktop(ctx: Context, device: dict) -> tuple[str, dict]:
             f"{'started' if test.get('taskManagerStarted') else 'did not start'}", test)
 
 
+@scenario("remote_cad", ("windows",), "Sends remote Ctrl+Alt+Del to the signed-in session and sees Windows' security screen open")
+def remote_cad(ctx: Context, device: dict) -> tuple[str, dict]:
+    row = ctx.command(device, "remote.cad.selftest", timeout=max(ctx.args.timeout, 180))
+    result = row.get("result") or {}
+    if isinstance(result, str):
+        result = json.loads(result)
+    attempts = result.get("attempts") or []
+    tried = "; ".join(f"{(a.get('selfTest') or {}).get('method') or a.get('method')}: reply {(a.get('selfTest') or {}).get('reply')}, "
+                      f"desktop {(a.get('selfTest') or {}).get('desktopBefore')} -> {(a.get('selfTest') or {}).get('desktopAfter')}"
+                      for a in attempts)
+    if not result.get("worked"):
+        raise Check(f"no way of sending Ctrl+Alt+Del opened Windows' security screen in session {result.get('windowsSession')} "
+                    f"(SoftwareSASGeneration={result.get('softwareSasGeneration')}): {tried}")
+    first = attempts[0].get("method") if attempts else None
+    if first != "auto":
+        raise Check(f"the method remote sessions use did not work; only {attempts[-1].get('method')} did: {tried}")
+    return f"Ctrl+Alt+Del opened Windows' security screen in session {result.get('windowsSession')} ({tried})", result
+
+
 @scenario("key_rotation", ("windows", "linux", "macos"), "Replaces its device API key when asked, and keeps reporting")
 def key_rotation(ctx: Context, device: dict) -> tuple[str, dict]:
     before = ctx.device(device["id"])["device"].get("apiKeyRotatedAt")
@@ -572,6 +591,44 @@ def key_rotation(ctx: Context, device: dict) -> tuple[str, dict]:
     seen = wait_for("a check-in with the new key", reported, max(ctx.args.timeout, 180), interval=10)
     return (f"key replaced at {row['apiKeyRotatedAt']}; checked in again at {seen} (the old key is now refused)",
             {"rotatedAt": row["apiKeyRotatedAt"], "lastSeenAt": seen})
+
+
+@scenario("service_restart", ("windows",), "Stops cleanly when an upgrade asks it to, then starts and reports again")
+def service_restart(ctx: Context, device: dict) -> tuple[str, dict]:
+    """What every silent upgrade does first: the agent's authorised stop (--stop). A stop that hangs left real machines
+    running but silent after an upgrade (error 1053), so it must reach STOPPED quickly, then start and check in."""
+    import subprocess
+
+    if os.name != "nt" or os.environ.get("COMPUTERNAME", "").lower() != str(device.get("hostname", "")).lower():
+        raise Skip("runs on the Windows machine under test only")
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\FenrirAgent") as key:
+        image = str(winreg.QueryValueEx(key, "ImagePath")[0]).strip()
+    exe = image[1:image.index('"', 1)] if image.startswith('"') else image.split()[0]
+
+    def state() -> str:
+        out = subprocess.run(["sc.exe", "query", "FenrirAgent"], capture_output=True, text=True).stdout
+        return next((line.split()[-1] for line in out.splitlines() if "STATE" in line), "UNKNOWN")
+
+    first = ctx.device(device["id"])["device"].get("lastSeenAt")
+    started = time.monotonic()
+    stop = subprocess.run([exe, "--stop"], capture_output=True, text=True, timeout=120)
+    took = round(time.monotonic() - started, 1)
+    if stop.returncode != 0 or state() != "STOPPED":
+        raise Check(f"the authorised stop failed after {took}s (exit {stop.returncode}, state {state()}): "
+                    f"{(stop.stdout + stop.stderr).strip()[-300:]}")
+    if took > 30:
+        raise Check(f"the agent took {took}s to stop; an upgrade gives it 20-30 seconds")
+    subprocess.run(["sc.exe", "start", "FenrirAgent"], capture_output=True, text=True)
+    wait_for("the service to be running again", lambda: state() == "RUNNING", 60, interval=3)
+
+    def reported():
+        seen = ctx.device(device["id"])["device"].get("lastSeenAt")
+        return seen if seen and seen != first else None
+
+    seen = wait_for("a check-in after the restart", reported, max(ctx.args.timeout, 180), interval=10)
+    return f"stopped in {took}s when asked, started again and checked in at {seen}", {"stopSeconds": took, "lastSeenAt": seen}
 
 
 @scenario("patch_scan", ("windows", "linux"), "Scans for missing updates")

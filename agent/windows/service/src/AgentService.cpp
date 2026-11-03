@@ -4,6 +4,7 @@
 #include "TemporaryAdmin.h"
 #include "CrashReporter.h"
 #include "SystemProfile.h"
+#include "ActiveDirectoryOps.h"
 #include "ExtendedPolicy.h"
 #include "FirewallPolicy.h"
 #include "AmtWsman.h"
@@ -12,6 +13,7 @@
 #include "RemotePipeIo.h"
 #include "RemoteSasRequest.h"
 
+#include <tlhelp32.h>
 #include <wtsapi32.h>
 
 #include "RmmExecutors.h"
@@ -1218,8 +1220,10 @@ void AgentService::RequestStop() {
   if (stopEvent_ != nullptr) {
     SetEvent(stopEvent_);
   }
+  // Never wait here: this runs in Windows' service control handler, and a handler that blocks leaves the service
+  // unable to answer Windows (error 1053) with its work already stopped. Run() joins the channel when it ends.
   if (localControlChannel_) {
-    localControlChannel_->Stop();
+    localControlChannel_->RequestStop();
   }
 }
 
@@ -2113,6 +2117,28 @@ std::wstring AgentService::ExecuteCommand(const RemoteCommand& command) {
     SecureZeroMemory(credential.password.data(), credential.password.size() * sizeof(wchar_t));
     return Utf8ToWide(result);
   }
+  if (command.type == L"ad.directory") {
+    // Hybrid identity: one allowlisted Active Directory operation (or an Entra Connect delta sync) on this server.
+    std::wstring secret;
+    const auto request = json::Parse(WideToUtf8(command.payloadJson));
+    if (request && request->IsObject() && request->Get("secret") && request->Get("secret")->Bool().value_or(false)) {
+      const auto released = json::Parse(controlPlaneClient_->FetchCommandSecret(IdentitySnapshot(), command.commandId));
+      if (!released || !released->IsObject() || !released->Get("secret")) {
+        throw std::runtime_error("The one-time secret for this Active Directory change could not be read");
+      }
+      secret = Utf8ToWide(released->Get("secret")->String().value_or(""));
+    }
+    const auto workRoot = config_.runtimeDatabasePath.parent_path() / L"ad";
+    std::string result;
+    try {
+      result = RunActiveDirectoryOperation(WideToUtf8(command.payloadJson), secret, workRoot);
+    } catch (...) {
+      SecureZeroMemory(secret.data(), secret.size() * sizeof(wchar_t));
+      throw;
+    }
+    SecureZeroMemory(secret.data(), secret.size() * sizeof(wchar_t));
+    return Utf8ToWide(result);
+  }
   if (command.type == L"amsi.telemetry.submit") {
     return ExecuteAmsiTelemetrySubmitCommand(command);
   }
@@ -2270,6 +2296,9 @@ std::wstring AgentService::ExecuteCommand(const RemoteCommand& command) {
   }
   if (command.type == L"remote.backstage.selftest") {
     return RunBackstageSelfTest();
+  }
+  if (command.type == L"remote.cad.selftest") {
+    return RunSasSelfTest();
   }
   if (command.type == L"patch.posture.refresh") {
     const auto summary = PatchOrchestrator(config_).RefreshPatchState();
@@ -3090,7 +3119,19 @@ std::string AllowServiceSas() {
   return value == 1 || value == 3 ? "" : "blocked by the 'Disable or enable software Secure Attention Sequence' Group Policy";
 }
 
-std::string SendSasFromService(HANDLE pipe, DWORD helperPid, DWORD windowsSession) {
+// How SendSAS is called. CI on Windows Server 2025 showed that calling it while impersonating the SYSTEM helper of
+// the target session is accepted and silently ignored, so the default is a direct call from the service, which Windows
+// honours for the console session. The others stay available for the self-test, which reports which one works.
+enum class SasMethod { Automatic, Direct, ImpersonateHelper, ImpersonateUser };
+
+SasMethod ParseSasMethod(const std::string& request) {
+  if (request == "sas:direct") return SasMethod::Direct;
+  if (request == "sas:impersonate") return SasMethod::ImpersonateHelper;
+  if (request == "sas:user") return SasMethod::ImpersonateUser;
+  return SasMethod::Automatic;
+}
+
+std::string SendSasFromService(HANDLE pipe, DWORD helperPid, DWORD windowsSession, SasMethod method = SasMethod::Automatic) {
   using SendSasFn = VOID(WINAPI*)(BOOL);
   if (auto error = AllowServiceSas(); !error.empty()) {
     return error;
@@ -3125,13 +3166,34 @@ std::string SendSasFromService(HANDLE pipe, DWORD helperPid, DWORD windowsSessio
   const auto denied = remote::ValidateSasCaller(helperPid, callerPid, windowsSession, tokenSession,
                                                system, identity && level >= SecurityImpersonation);
   if (token) CloseHandle(token);
-  if (denied.empty()) {
-    fn(FALSE);  // A real service, impersonating the SYSTEM helper in the target session.
+  if (method == SasMethod::Automatic) {
+    method = windowsSession == WTSGetActiveConsoleSessionId() ? SasMethod::Direct : SasMethod::ImpersonateHelper;
+  }
+  if (denied.empty() && method == SasMethod::ImpersonateHelper) {
+    fn(FALSE);  // still impersonating the SYSTEM helper in the target session
   }
   const bool reverted = RevertToSelf() != FALSE;
+  if (!reverted) {
+    FreeLibrary(sas);
+    return "could not restore the service security context after Ctrl+Alt+Del";
+  }
+  std::string failure(denied);
+  if (failure.empty() && method == SasMethod::Direct) {
+    fn(FALSE);  // as the service itself: Windows sends it to the console session
+  } else if (failure.empty() && method == SasMethod::ImpersonateUser) {
+    HANDLE userToken = nullptr;
+    if (!WTSQueryUserToken(windowsSession, &userToken)) {
+      failure = "nobody is signed in to that Windows session (error " + std::to_string(GetLastError()) + ")";
+    } else if (!ImpersonateLoggedOnUser(userToken)) {
+      failure = "could not act as the signed-in user";
+    } else {
+      fn(FALSE);
+      if (!RevertToSelf()) failure = "could not restore the service security context after Ctrl+Alt+Del";
+    }
+    if (userToken) CloseHandle(userToken);
+  }
   FreeLibrary(sas);
-  if (!reverted) return "could not restore the service security context after Ctrl+Alt+Del";
-  return std::string(denied);
+  return failure;
 }
 
 std::wstring SasPipeName(const std::wstring& sessionId) {
@@ -3182,10 +3244,10 @@ void ServeSasRequests(std::wstring pipeName, DWORD helperPid, DWORD windowsSessi
     std::string reply;
     if (clientPid != helperPid) {
       reply = "error: only the remote session's helper may request Ctrl+Alt+Del";
-    } else if (!received || std::string(request, read) != "sas") {
+    } else if (!received || std::string(request, read).rfind("sas", 0) != 0 || read > 16) {
       reply = "error: unknown request";
     } else {
-      const auto failure = SendSasFromService(pipe, helperPid, windowsSession);
+      const auto failure = SendSasFromService(pipe, helperPid, windowsSession, ParseSasMethod(std::string(request, read)));
       reply = failure.empty() ? "ok" : "error: " + failure;
     }
     overlapped = {};
@@ -3425,6 +3487,118 @@ std::wstring AgentService::LaunchRemoteHelper(const RemoteCommand& command) {
          L",\"logPath\":\"" + Utf8ToWide(EscapeJsonString(logPath.wstring())) + L"\"}";
 }
 
+namespace {
+int CountProcessesInSession(const wchar_t* exe, DWORD session) {
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) return -1;
+  PROCESSENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  int count = 0;
+  for (BOOL more = Process32FirstW(snapshot, &entry); more; more = Process32NextW(snapshot, &entry)) {
+    DWORD owner = 0;
+    if (_wcsicmp(entry.szExeFile, exe) == 0 && ProcessIdToSessionId(entry.th32ProcessID, &owner) && owner == session) ++count;
+  }
+  CloseHandle(snapshot);
+  return count;
+}
+
+DWORD SasPolicyValue() {
+  DWORD value = 0, size = sizeof(value);
+  if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", L"SoftwareSASGeneration",
+                   RRF_RT_REG_DWORD, nullptr, &value, &size) != ERROR_SUCCESS) {
+    return 0xFFFFFFFF;
+  }
+  return value;
+}
+}  // namespace
+
+// Proves remote Ctrl+Alt+Del on this machine through the real path: the helper is started in the interactive
+// Windows session exactly as for a remote desktop session, asks this service over its pipe, and reports whether
+// Windows switched that session to its secure desktop. The service also watches for LogonUI.exe in that session.
+// It shows the Windows security screen on that session, so run it only where that is acceptable.
+std::wstring AgentService::RunSasSelfTest() {
+  const auto helper = config_.installRootPath / L"fenrir-remote.exe";
+  std::error_code ec;
+  if (!std::filesystem::exists(helper, ec)) {
+    throw std::runtime_error("The remote access helper (fenrir-remote.exe) is not installed");
+  }
+  const DWORD windowsSession = InteractiveSessionId();
+  if (windowsSession == 0 || windowsSession == 0xFFFFFFFF) {
+    throw std::runtime_error("No interactive Windows session is available to test Ctrl+Alt+Del");
+  }
+  const auto folder = config_.runtimeDatabasePath.parent_path() / L"remote";
+  std::filesystem::create_directories(folder, ec);
+  std::wstring attempts;
+  bool worked = false;
+  const int logonUiBefore = CountProcessesInSession(L"LogonUI.exe", windowsSession);
+  int logonUiAfter = logonUiBefore;
+  for (const wchar_t* method : {L"auto", L"direct", L"impersonate", L"user"}) {
+  const auto id = L"sas-selftest-" + GenerateGuidString();
+  const auto resultPath = folder / (id + L".json");
+  std::wstring commandLine = L"\"" + helper.wstring() + L"\" --sas-selftest " + id + L" \"" + resultPath.wstring() + L"\" " + method;
+  std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+  mutableCommand.push_back(L'\0');
+  HANDLE self = nullptr, primary = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID, &self) ||
+      !DuplicateTokenEx(self, MAXIMUM_ALLOWED, nullptr, SecurityImpersonation, TokenPrimary, &primary)) {
+    if (self) CloseHandle(self);
+    throw std::runtime_error("Could not prepare the helper token");
+  }
+  CloseHandle(self);
+  DWORD target = windowsSession;
+  if (!SetTokenInformation(primary, TokenSessionId, &target, sizeof(target))) {
+    const DWORD error = GetLastError();
+    CloseHandle(primary);
+    throw std::runtime_error("Could not target the interactive Windows session (error " + std::to_string(error) + ")");
+  }
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  wchar_t desktop[] = L"winsta0\\default";
+  startup.lpDesktop = desktop;
+  PROCESS_INFORMATION process{};
+  const BOOL created = CreateProcessAsUserW(primary, helper.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE,
+                                            CREATE_NEW_PROCESS_GROUP, nullptr, helper.parent_path().c_str(), &startup, &process);
+  CloseHandle(primary);
+  if (!created) {
+    throw std::runtime_error("Could not start the helper in the interactive session (error " + std::to_string(GetLastError()) + ")");
+  }
+  CloseHandle(process.hThread);
+  HANDLE watched = nullptr;
+  if (!DuplicateHandle(GetCurrentProcess(), process.hProcess, GetCurrentProcess(), &watched, SYNCHRONIZE, FALSE, 0)) {
+    TerminateProcess(process.hProcess, 1);
+    CloseHandle(process.hProcess);
+    throw std::runtime_error("Could not start the Ctrl+Alt+Del service channel");
+  }
+  std::thread(ServeSasRequests, SasPipeName(id), process.dwProcessId, windowsSession, watched).detach();
+  const DWORD waited = WaitForSingleObject(process.hProcess, 20000);
+  if (waited != WAIT_OBJECT_0) TerminateProcess(process.hProcess, 1);
+  DWORD exitCode = 0;
+  GetExitCodeProcess(process.hProcess, &exitCode);
+  CloseHandle(process.hProcess);
+  logonUiAfter = CountProcessesInSession(L"LogonUI.exe", windowsSession);
+  for (int i = 0; i < 12 && logonUiAfter <= logonUiBefore; ++i) {
+    Sleep(250);
+    logonUiAfter = CountProcessesInSession(L"LogonUI.exe", windowsSession);
+  }
+  std::ifstream in(resultPath, std::ios::binary);
+  std::string result((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  in.close();
+  std::filesystem::remove(resultPath, ec);
+  if (result.empty() || result.front() != '{') result = "null";
+  attempts += std::wstring(attempts.empty() ? L"" : L",") + L"{\"method\":\"" + method + L"\",\"exitCode\":" + std::to_wstring(exitCode) +
+              L",\"logonUiAfter\":" + std::to_wstring(logonUiAfter) + L",\"selfTest\":" + Utf8ToWide(result) + L"}";
+  if (exitCode == 0 || logonUiAfter > logonUiBefore) {
+    worked = true;
+    break;  // the security screen is open now; later methods could not be told apart
+  }
+  }
+  const DWORD policy = SasPolicyValue();
+  return L"{\"worked\":" + std::wstring(worked ? L"true" : L"false") + L",\"windowsSession\":" + std::to_wstring(windowsSession) +
+         L",\"consoleSession\":" + std::to_wstring(WTSGetActiveConsoleSessionId()) + L",\"logonUiBefore\":" + std::to_wstring(logonUiBefore) +
+         L",\"softwareSasGeneration\":" + (policy == 0xFFFFFFFF ? std::wstring(L"null") : std::to_wstring(policy)) +
+         L",\"attempts\":[" + attempts + L"]}";
+}
+
 // Proves the backstage hidden desktop on this machine: runs the helper's self-test as SYSTEM in session 0 (where
 // backstage sessions run) and returns what it found. Nothing appears in the signed-in user's session.
 std::wstring AgentService::RunBackstageSelfTest() {
@@ -3554,20 +3728,32 @@ void AgentService::RealtimeLoop() {
       SetEvent(wakeEvent_);  // Main loop owns execution and journal persistence.
       if (interactiveWakeEvent_) SetEvent(interactiveWakeEvent_);
       realtimeConnected_ = true;
-      // A watcher closes the socket when the service stops, which unblocks Receive.
+      // A watcher pings every 25 seconds (the server answers "pong") and closes the socket when the service stops or
+      // the server has gone quiet: a connection dropped silently (a router or proxy timing it out, the server
+      // restarting, the network changing) would otherwise leave Receive waiting forever while the agent believes it
+      // is connected and the server shows the device offline.
       std::atomic<bool> done{false};
+      std::atomic<ULONGLONG> lastHeard{GetTickCount64()};
       std::thread watcher([&] {
         while (!done) {
-          if (WaitForSingleObject(stopEvent_, 30000) == WAIT_OBJECT_0) {
+          if (WaitForSingleObject(stopEvent_, 25000) == WAIT_OBJECT_0) {
             socket.Close();
             return;
           }
-          socket.SendText("ping");
+          if (done) return;
+          if (!socket.SendText("ping") || GetTickCount64() - lastHeard.load() > 75000) {
+            socket.Close();  // unblocks Receive; the loop reconnects
+            return;
+          }
         }
       });
       std::string message;
       bool binary = false;
       while (!ShouldStop() && socket.Receive(&message, &binary)) {
+        lastHeard = GetTickCount64();
+        if (message == "pong") {
+          continue;
+        }
         if (message.find("\"commands\"") != std::string::npos || message.find("\"pollNow\":true") != std::string::npos) {
           SetEvent(wakeEvent_);
           if (interactiveWakeEvent_) SetEvent(interactiveWakeEvent_);
@@ -3592,10 +3778,17 @@ void AgentService::RealtimeLoop() {
     if (GetTickCount64() - started > 60000) {
       backoff = 5000;
     }
+    // While the live connection is down, still tell the server the agent is here: the main loop's heartbeat can be
+    // minutes away when it is busy (a scan, a long script, an update), and the device must not show offline for that.
+    try {
+      controlPlaneClient_->SendPresence(IdentitySnapshot());
+    } catch (const std::exception&) {
+      // the server is unreachable too; the next attempt says so
+    }
     if (WaitForSingleObject(stopEvent_, backoff) == WAIT_OBJECT_0) {
       return;
     }
-    backoff = std::min<DWORD>(backoff * 2, 120000);
+    backoff = std::min<DWORD>(backoff * 2, 60000);
   }
 }
 

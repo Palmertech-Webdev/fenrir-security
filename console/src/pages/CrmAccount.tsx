@@ -1,4 +1,6 @@
 import { displayValue } from "../components/DisplayValue";
+import { OnboardingChecklist } from "../components/OnboardingChecklist";
+import { CustomerWorkspace } from "../components/CustomerWorkspace";
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ago, api, money } from "../api";
@@ -6,6 +8,7 @@ import { useApp } from "../app-context";
 import { ErrorNote, PageHead, Pill, Stat, Table, useAction, useData } from "../components/ui";
 import { CrmEditor } from "./Crm";
 import { promptDialog } from "../components/dialogs";
+import { CustomerActions } from "../components/CustomerManage";
 
 const TIMELINE_TONE: Record<string, string> = { ticket: "warn", invoice: "muted", opportunity: "good", task: "blue" };
 
@@ -33,12 +36,18 @@ export default function CrmAccount() {
                 subtitle={a ? <>Plan {displayValue(a.plan)} · {displayValue(data.devices)} devices · owner <b>{displayValue(a.accountOwner || "unassigned")}</b>
                   {can("crm") && <> · <button className="small" onClick={setOwner}>Change owner</button></>}
                   {" · "}<Link to={`/companies/${id}`}>Health and reports</Link></> : undefined}
-                actions={can("crm") && <span style={{ display: "inline-flex", gap: 6 }}>
+                actions={<span style={{ display: "inline-flex", gap: 6, flexWrap: "wrap" }}>
+                  {a && <CustomerActions customer={{ ...a, kind: "customer" }} onChanged={reload} />}
+                  {can("crm") && <>
                   <button onClick={() => blank("activities", { kind: "call", direction: "outbound" })}>Log activity</button>
                   <button onClick={() => blank("activities", { kind: "task" })}>Add task</button>
-                  <button className="primary" onClick={() => blank("opportunities", { kind: "Upsell", stage: "Prospecting" })}>New opportunity</button>
+                  <button className="primary" onClick={() => blank("opportunities", { kind: "Upsell", stage: "Prospecting" })}>New opportunity</button></>}
                 </span>} />
       <ErrorNote error={error} />
+      {a?.archived && <p style={{ color: "#fcd34d" }}>This customer is archived: it is hidden from customer lists and cannot enrol new devices. Press <b>Restore</b> to bring it back.</p>}
+      {a && Object.keys(a.profile || {}).length > 0 && <p className="small muted">
+        {[a.profile.phone, a.profile.website, a.profile.address].filter(Boolean).map((v: string) => displayValue(v)).join(" · ")}
+        {a.profile.notes && <><br />{displayValue(a.profile.notes)}</>}</p>}
       <div className="grid k4">
         <Stat label="Contracted MRR" value={data ? money(data.mrr) : "—"} />
         <Stat label={`Revenue (${days} days)`} value={p ? money(p.revenue) : "—"} hint={p ? `${p.invoiceCount} invoices · ${money(p.outstanding)} outstanding` : undefined} />
@@ -51,7 +60,12 @@ export default function CrmAccount() {
         {[30, 90, 365].map((d) => <button key={d} className={`small ${d === days ? "primary" : ""}`} onClick={() => setDays(d)}>{d} days</button>)}
       </div>
 
-      <div className="grid k2" style={{ marginTop: 6 }}>
+      <div className="card" style={{ marginTop: 6 }}>
+        <h3 style={{ marginTop: 0 }}>Workspace</h3>
+        <CustomerWorkspace tenantId={id} />
+      </div>
+
+      <div className="grid k2" style={{ marginTop: 14 }}>
         <div className="card">
           <h3>Timeline</h3>
           <Table rows={data?.timeline.map((t: any) => ({ ...t, id: `${t.type}:${t.ref}` }))} empty="No history yet."
@@ -61,6 +75,10 @@ export default function CrmAccount() {
                            { key: "at", label: "When", render: (t) => <>{ago(t.at)}{t.by && <div className="small muted">{displayValue(t.by)}</div>}</> }]} />
         </div>
         <div>
+          <div className="card" style={{ marginBottom: 14 }}>
+            <h3>Onboarding</h3>
+            <OnboardingChecklist tenantId={id} compact />
+          </div>
           <div className="card">
             <h3>Opportunities</h3>
             <Table rows={data?.opportunities} onRow={(o) => setEditing({ kind: "opportunities", row: o })} empty="No deals for this account."

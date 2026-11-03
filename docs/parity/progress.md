@@ -10,8 +10,8 @@ Baseline of the review: `main` at `790e364`. Work branch: `claude/jolly-goodall-
 |---|---|
 | verified | 6 (FIX-01 to FIX-05, FIX-08) |
 | implemented-unverified | 10 (FIX-07, AGT-04, CORE-03 and 7 requirements the brief marked U) |
-| partial | 96 |
-| missing | 65 |
+| partial | 101 |
+| missing | 60 |
 | externally-blocked | 1 (FIX-06) |
 
 Overall parity: **not passed**. MVP: **not yet declared**.
@@ -20,12 +20,12 @@ Overall parity: **not passed**. MVP: **not yet declared**.
 
 | ID | Commit | Evidence |
 |---|---|---|
-| FIX-01 | `c6de2d9` | Lab/production build profiles. [Smoke run 40590036336](https://github.com/mattp8638/AntiVirus/actions/runs/40590036336) passed: lab build/start, HTTP smoke, production refuses to build without a certificate, packaged-agent checks. |
+| FIX-01 | `c6de2d9` | Lab/production build profiles. [Smoke run 40590036336](the project repository/actions/runs/40590036336) passed: lab build/start, HTTP smoke, production refuses to build without a certificate, packaged-agent checks. |
 | FIX-02 | `378c78d` | Coverage-aware OSV verification; `test_scan_integrity.py` (12 cases) |
 | FIX-03 | `2eb277a` | Server-side revocable sessions, remote viewer cut-off; `test_sessions.py` |
 | FIX-04 | `d07687c` | Unresolved exposure counted regardless of workflow state; `test_exposure_counts.py` |
 | FIX-05 | `d87ca95` | Compare-and-swap audit chain head; `test_audit_concurrency.py` (failure reproduced on PostgreSQL 16 before the fix) |
-| FIX-08 | `8fda3b7` | Framework revisions: reworded requirements need review, dry-run diff, snapshots, historical export; `test_grc_revisions.py`. Verified in CI ([run 78](https://github.com/mattp8638/AntiVirus/actions/runs/40649462515)). |
+| FIX-08 | `8fda3b7` | Framework revisions: reworded requirements need review, dry-run diff, snapshots, historical export; `test_grc_revisions.py`. Verified in CI (run 78 (pre-release CI)). |
 | (owner request) | `473eb80` | Remote desktop Ctrl+Alt+Del is now sent by the agent service. Cross-compiled only; not yet tested on a real server (RMM-09/RMM-10). |
 | FIX-07 / AGT-03 / AGT-04 | (this milestone) | Signed Linux/macOS agent releases; staged rollouts with automatic pause. See `release_test.go` and `test_rollouts.py`. |
 | CORE-01 (API) | (this milestone) | Cross-customer matrix over every API operation. Fixed: customer users could change MSP-wide PSA settings (including the inbound email token); a read-only viewer could edit tickets; non-staff could set staff ticket fields; foreign board/device IDs were accepted on tickets; the portal matched contacts across customers. |
@@ -42,11 +42,46 @@ Overall parity: **not passed**. MVP: **not yet declared**.
 | CORE-01 (background jobs) | (this batch) | Every scheduled and hourly job run over two customers' data, including a hostile cross-customer schedule: nothing crosses. `test_background_scope.py` (fails when the target filter is broken). |
 | RMM-09 (owner request) | (this batch) | Backstage hidden SYSTEM desktop on Windows (session 0) with a tools launcher; nothing reaches the user's session. Self-test command and Windows CI acceptance check. |
 | CORE-15 (approvals) | (this batch) | Optional two-person approval bound to the exact request and its devices; `test_approvals.py`. |
-| CI | `b5cf672` | Removed the placeholder signing files that the merge brought back. [Run 78](https://github.com/mattp8638/AntiVirus/actions/runs/40649462515) passed, which also verifies FIX-08 in CI. |
+| CI | `b5cf672` | Removed the placeholder signing files that the merge brought back. Run 78 (pre-release CI) passed, which also verifies FIX-08 in CI. |
+| Agent health | `bc4455e` | Every agent's build against the server's, why it is not updating (policy, paused rollout, ring), failures reported in 7 days by component until it recovers, failed commands; paused rollouts are shown. |
+| Releases | `51834a6` | Servers follow release tags (stable) or candidates (staging) or a branch; release workflow tests the tag and publishes notes. |
+| False positives (CI) | `37445aa` | Clean-software suite scans 400 installed files on Windows CI; it found a Python wheel quarantined at 99 and four reported scripts; fixed (package archives, compressed bytes, admin-only folders report-only on heuristics). Passes with no quarantine. |
+| FLOW-02 | `6ce7695` | Vulnerability -> ticket (joined per CVE) -> fix (optionally approved) -> rescan -> resolved, with evidence; failed or unconfirmed fixes reopen. `test_flow_vulnerability.py`. |
+| FLOW-04 | `6ce7695` | Monitor tickets close only after recovery and a successful self-heal; recurrences open a new ticket; remediation-package tickets resolve when the check passes. |
+| FLOW-01 | `6626608` | Onboarding checklist per customer from real state, with real failures; duplicate customers refused. `test_onboarding.py`. |
+| FLOW-05 | `6626608` | Leavers: devices to collect, vault credentials flagged for rotation, billing effect; mailbox hand-over (Exchange). |
+| FLOW-09 | `3873aa1` | Customer workspace: tickets, devices needing attention, alerts, incidents, urgent vulnerabilities, M365, backups, onboarding, recent actions. `test_workspace.py`. |
+| M365 batch 3 | `7e5182c`, `3a6bf02` | Exchange administration and 11 directory/Exchange security standards with drift. Awaiting owner test (test plan sections 10 and 11). |
+| Defender control | `6eb9508`, `d9783e4` | Fenrir is the source of truth for Defender: exclusions both ways (optionally authoritative), scanning, schedules, threat actions, UI lockdown, CFA folders/apps, allowed threats, device actions. Verified on Windows Server in CI (schedule bug found there and fixed). |
+| Sign-in protection | `bb77f31` | Impossible travel, new country and password-guessing success from stored sign-in logs, with a playbook (sign out, block, ticket, email). Test plan 12. |
+| M365 batches 5, 7, 8 | `d9d4392`, `2993eba`, `1cb507a` | Intune (devices, actions, BitLocker/LAPS, policies, apps, Autopilot), reports with schedules, email security standards, Teams/SharePoint/OneDrive and sharing standards, OneDrive hand-over. Test plan 13-16. |
+| Detection (found in CI) | `5f6dc90` | Firefox was quarantined as BlackCat on the Windows CI runner: signature "chain" rules fired on any one marker. Rules now take an optional match count (ransomware chains need every marker), and the installer ships the trusted-publisher, known-good and observe-only lists that only a build tree had. `SignatureRuleMatchTests.ps1` in Windows CI. |
+
+## Microsoft 365 phase (owner request, 2026-11-02)
+
+Goal: one place for Microsoft 365 administration, matching what MSPs use CIPP and AdminDroid for, joined up with Fenrir's PSA, CRM, SOC and
+GRC. Delivered in batches; one PR each.
+
+**Exit requirement for every batch:** Claude provides step-by-step test instructions (`docs/M365_TEST_PLAN.md`) and the owner tests
+them on their own tenant. A batch is not done until the owner reports the results and any failures are fixed. Simulated-tenant tests
+are required but do not count as the exit.
+
+| Batch | Scope | State |
+|---|---|---|
+| 1 | Tenant workspace: cross-tenant overview, per-tenant workspace (organisation, domains, admins, service health, inactive licensed users), per-feature permission check and Update permissions, background sync, sign-in and audit log store (730 days, search, CSV export) | Built, mock-tested; **awaiting owner test** (AT-35) |
+| 2 | Identity: password reset, MFA reset, Temporary Access Pass, temporary admin roles with automatic removal, manager, guests, new groups; resumable new-starter, offboarding and bulk CSV import with PSA ticket and CRM contact | Built, mock-tested; **awaiting owner test** (AT-35) |
+| 2b | Hybrid identity (owner request): users synced from AD by Entra Connect are offboarded and created on the domain controller through the Fenrir agent (disable, random password, AD groups, leavers OU, address book, sync; create with OU, groups and manager), then finished in Microsoft 365; waiting steps continue in the background | Built, mock-tested, AD script tested in Windows CI; **awaiting owner test** (AT-37) |
+| 3 | Exchange: mailboxes, shared mailboxes, permissions, forwarding, out-of-office, aliases, distribution lists, mail rules, quarantine, message trace; mailbox steps in offboarding | Built (Exchange Online admin endpoint, allowlisted cmdlets), mock-tested; **awaiting owner test** (test plan section 10) |
+| 4 | Security: Conditional Access templates and named locations, compromised-account check, SPF/DKIM/DMARC check, alert rules on audit events feeding the SOC | Planned |
+| 5 | Intune: device actions, BitLocker and LAPS keys, app deployment, Autopilot | Planned |
+| 6 | Standards: from 4 to about 60, templates, tenant groups, drift and exceptions | Planned |
+| 7 | Reports (AdminDroid): inactive users, licence waste, external sharing, mailbox sizes, Teams/SharePoint usage, scheduled email reports | Planned |
+| 8 | Teams, SharePoint and OneDrive | Planned |
 
 ## In progress
 
 - Phase 1 (CORE and AGT).
+- Microsoft 365 phase, batches 1 and 2: awaiting the owner's test on their tenant.
 
 ## Externally blocked
 

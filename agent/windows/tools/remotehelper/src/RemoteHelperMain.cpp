@@ -214,13 +214,60 @@ void SyncInputDesktop() {
 struct Monitor {
   RECT rect{};
   bool primary{false};
+  int scalePercent{100};
 };
+
+// Capture works in real (physical) pixels on every monitor. A "system DPI aware" process is given a scaled-down copy
+// of the screen whenever a monitor's scaling differs from the scaling Windows recorded at sign-in (scaling changed
+// without signing out, a docked laptop, mixed monitors): the viewer then shows a low-resolution desktop with
+// everything oversized. Per-monitor awareness (Windows 10 1703+) avoids that; older systems fall back step by step.
+void UsePhysicalPixels() {
+  using SetContext = BOOL(WINAPI*)(HANDLE);
+  if (const auto user32 = GetModuleHandleW(L"user32.dll")) {
+    if (const auto set = reinterpret_cast<SetContext>(GetProcAddress(user32, "SetProcessDpiAwarenessContext"))) {
+      if (set(reinterpret_cast<HANDLE>(static_cast<LONG_PTR>(-4))) || set(reinterpret_cast<HANDLE>(static_cast<LONG_PTR>(-3)))) {
+        return;  // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, then PER_MONITOR_AWARE
+      }
+    }
+  }
+  using SetAwareness = HRESULT(WINAPI*)(int);
+  if (const auto shcore = LoadLibraryW(L"shcore.dll")) {
+    if (const auto set = reinterpret_cast<SetAwareness>(GetProcAddress(shcore, "SetProcessDpiAwareness"))) {
+      if (SUCCEEDED(set(2))) return;  // PROCESS_PER_MONITOR_DPI_AWARE (Windows 8.1)
+    }
+  }
+  SetProcessDPIAware();
+}
+
+// The banner and chat windows are laid out in fixed sizes; system awareness on their thread lets Windows scale them
+// to the user's display scaling, as before.
+void UseScaledWindowsOnThisThread() {
+  using SetThreadContext = HANDLE(WINAPI*)(HANDLE);
+  if (const auto user32 = GetModuleHandleW(L"user32.dll")) {
+    if (const auto set = reinterpret_cast<SetThreadContext>(GetProcAddress(user32, "SetThreadDpiAwarenessContext"))) {
+      set(reinterpret_cast<HANDLE>(static_cast<LONG_PTR>(-2)));  // DPI_AWARENESS_CONTEXT_SYSTEM_AWARE
+    }
+  }
+}
+
+// The display scaling of a monitor in percent (100 when unknown).
+int MonitorScalePercent(HMONITOR monitor) {
+  using GetDpi = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+  static const auto get = [] {
+    const auto shcore = LoadLibraryW(L"shcore.dll");
+    return shcore ? reinterpret_cast<GetDpi>(GetProcAddress(shcore, "GetDpiForMonitor")) : nullptr;
+  }();
+  UINT x = 96, y = 96;
+  if (get && SUCCEEDED(get(monitor, 0, &x, &y)) && x > 0) return static_cast<int>(x * 100 / 96);
+  return 100;
+}
 
 BOOL CALLBACK CollectMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM data) {
   MONITORINFO info{};
   info.cbSize = sizeof(info);
   if (GetMonitorInfoW(monitor, &info)) {
-    reinterpret_cast<std::vector<Monitor>*>(data)->push_back({info.rcMonitor, (info.dwFlags & MONITORINFOF_PRIMARY) != 0});
+    reinterpret_cast<std::vector<Monitor>*>(data)->push_back({info.rcMonitor, (info.dwFlags & MONITORINFOF_PRIMARY) != 0,
+                                                             MonitorScalePercent(monitor)});
   }
   return TRUE;
 }
@@ -448,7 +495,8 @@ void Session::Info() {
   for (std::size_t i = 0; i < monitors.size(); ++i) {
     const auto& r = monitors[i].rect;
     out << (i ? "," : "") << "{\"index\":" << i << ",\"x\":" << r.left << ",\"y\":" << r.top << ",\"w\":" << (r.right - r.left)
-        << ",\"h\":" << (r.bottom - r.top) << ",\"primary\":" << (monitors[i].primary ? "true" : "false") << "}";
+        << ",\"h\":" << (r.bottom - r.top) << ",\"scale\":" << monitors[i].scalePercent
+        << ",\"primary\":" << (monitors[i].primary ? "true" : "false") << "}";
   }
   out << "]}";
   SendJson(out.str());
@@ -581,7 +629,7 @@ void TypeText(const std::wstring& text) {
 // Asks the Fenrir service (a real service in session 0, where SendSAS is honoured) to send Ctrl+Alt+Del.
 // Both reads and writes have a deadline; no direct helper fallback can claim a
 // successful SAS just because the void SendSAS function returned.
-std::string RequestSasFromService(const std::string& sessionId) {
+std::string RequestSasFromService(const std::string& sessionId, const std::string& request = "sas") {
   if (sessionId.empty() || sessionId.size() > 64 || sessionId.find_first_of("\\/:*?\"<>|") != std::string::npos) {
     return "error: invalid remote session id";
   }
@@ -620,9 +668,9 @@ std::string RequestSasFromService(const std::string& sessionId) {
   };
   OVERLAPPED operation{};
   operation.hEvent = event;
-  const BOOL writing = WriteFile(pipe, "sas", 3, nullptr, &operation);
+  const BOOL writing = WriteFile(pipe, request.data(), static_cast<DWORD>(request.size()), nullptr, &operation);
   const DWORD writeError = GetLastError();
-  bool ok = remote::FinishPipeIo(pipe, operation, writing, writeError, remaining(), nullptr, written) && written == 3;
+  bool ok = remote::FinishPipeIo(pipe, operation, writing, writeError, remaining(), nullptr, written) && written == request.size();
   if (ok) {
     operation = {};
     operation.hEvent = event;
@@ -652,6 +700,43 @@ std::string SendCtrlAltDel(const std::string& sessionId) {
     return "";
   }
   return reply.rfind("error: ", 0) == 0 ? reply.substr(7) : "invalid reply from the Ctrl+Alt+Del service channel";
+}
+
+// The name of this session's input desktop: "Default" for the user's desktop, "Winlogon" for the secure desktop that
+// Ctrl+Alt+Del, the lock screen and the sign-in screen use. "" when it cannot be opened.
+std::string InputDesktopName() {
+  HDESK desk = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+  if (!desk) return "";
+  wchar_t name[256]{};
+  DWORD needed = 0;
+  const bool ok = GetUserObjectInformationW(desk, UOI_NAME, name, sizeof(name), &needed) != FALSE;
+  CloseDesktop(desk);
+  return ok ? WideToUtf8(name) : "";
+}
+
+// Proves Ctrl+Alt+Del on this machine through the real path: this helper (started by the service in the signed-in
+// session, as for a remote session) asks the service over the session's pipe, then watches whether Windows switched
+// this session to its secure desktop. Writes JSON to resultPath; returns 0 when the secure desktop appeared.
+int RunSasSelfTest(const std::string& sessionId, const std::wstring& resultPath, const std::string& method) {
+  DWORD session = 0;
+  ProcessIdToSessionId(GetCurrentProcessId(), &session);
+  const auto before = InputDesktopName();
+  const auto reply = RequestSasFromService(sessionId, method.empty() || method == "auto" ? "sas" : "sas:" + method);
+  std::string after;
+  for (int waited = 0; waited < 5000; waited += 250) {
+    Sleep(250);
+    after = InputDesktopName();
+    if (after != before || _stricmp(after.c_str(), "Winlogon") == 0) break;
+  }
+  const bool secure = _stricmp(after.c_str(), "Winlogon") == 0;
+  const bool switched = secure && _stricmp(before.c_str(), "Winlogon") != 0;
+  std::ostringstream out;
+  out << "{\"helperSession\":" << session << ",\"method\":" << Q(method) << ",\"reply\":" << Q(reply) << ",\"desktopBefore\":" << Q(before)
+      << ",\"desktopAfter\":" << Q(after) << ",\"secureDesktop\":" << (secure ? "true" : "false")
+      << ",\"switchedToSecureDesktop\":" << (switched ? "true" : "false") << "}";
+  std::ofstream file(std::filesystem::path(resultPath), std::ios::binary | std::ios::trunc);
+  file << out.str();
+  return reply == "ok" && switched ? 0 : 1;
 }
 
 void Session::HandleInput(const std::string& type, const json::Value& m) {
@@ -1245,6 +1330,7 @@ LRESULT CALLBACK BannerProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 void UiThread(bool showBanner) {
+  UseScaledWindowsOnThisThread();
   WNDCLASSW banner{};
   banner.lpfnWndProc = BannerProc;
   banner.hInstance = GetModuleHandleW(nullptr);
@@ -1482,17 +1568,24 @@ int Session::Run() {
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   int argc = 0;
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-  std::wstring optionsPath, selfTestPath;
+  std::wstring optionsPath, selfTestPath, sasSession, sasResult, sasMethod;
   for (int i = 1; i + 1 < argc; ++i) {
     if (wcscmp(argv[i], L"--options") == 0) {
       optionsPath = argv[i + 1];
     } else if (wcscmp(argv[i], L"--backstage-selftest") == 0) {
       selfTestPath = argv[i + 1];
+    } else if (wcscmp(argv[i], L"--sas-selftest") == 0 && i + 2 < argc) {
+      sasSession = argv[i + 1];
+      sasResult = argv[i + 2];
+      if (i + 3 < argc) sasMethod = argv[i + 3];
     }
   }
   LocalFree(argv);
+  if (!sasSession.empty()) {
+    ExitProcess(static_cast<UINT>(RunSasSelfTest(WideToUtf8(sasSession), sasResult, WideToUtf8(sasMethod))));
+  }
   if (!selfTestPath.empty()) {
-    SetProcessDPIAware();
+    UsePhysicalPixels();
     ExitProcess(static_cast<UINT>(fenrir::remote::RunBackstageSelfTest(selfTestPath)));
   }
   Options options;
@@ -1503,7 +1596,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     HelperLog("Could not read the session options file.");
     return 1;
   }
-  SetProcessDPIAware();
+  UsePhysicalPixels();
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   Gdiplus::GdiplusStartupInput gdiplusInput;
   ULONG_PTR gdiplusToken = 0;

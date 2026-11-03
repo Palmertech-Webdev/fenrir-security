@@ -1,5 +1,6 @@
 import M365 from "./pages/M365";
 import M365Partner from "./pages/M365Partner";
+import M365Tenant from "./pages/M365Tenant";
 import Network from "./pages/Network";
 import NetworkTopology from "./pages/NetworkTopology";
 import OutOfBand from "./pages/OutOfBand";
@@ -34,6 +35,7 @@ import AttackSurface from "./pages/AttackSurface";
 import Compliance from "./pages/Compliance";
 import Crm from "./pages/Crm";
 import CrmAccount from "./pages/CrmAccount";
+import Onboarding from "./pages/Onboarding";
 import Billing from "./pages/Billing";
 import Portal from "./pages/Portal";
 
@@ -61,6 +63,7 @@ import ActiveDirectory from "./pages/ActiveDirectory";
 import { ProgrammeDetail } from "./pages/grc/Programmes";
 import { PolicyEditor as GrcPolicyEditor } from "./pages/grc/Policies";
 import ProtectionHealth from "./pages/ProtectionHealth";
+import AgentHealth from "./pages/AgentHealth";
 import Quarantine from "./pages/Quarantine";
 import EdrExclusions from "./pages/EdrExclusions";
 import Exposure from "./pages/Exposure";
@@ -109,6 +112,7 @@ const NAV: { group: string; items: { to: string; label: string; icon: string; al
       { to: "/automation", label: "Jobs & schedules", icon: "⏱" },
       { to: "/policies", label: "Protection policies", icon: "⚙" },
       { to: "/protection-health", label: "Protection health", icon: "⛨" },
+      { to: "/agent-health", label: "Agent health", icon: "✚" },
       { to: "/quarantine", label: "Quarantine", icon: "⊘" },
       { to: "/vulnerabilities", label: "Vulnerabilities", icon: "⚠" },
       { to: "/out-of-band", label: "Out-of-band (Intel AMT)", icon: "⏻" },
@@ -140,6 +144,7 @@ const NAV: { group: string; items: { to: string; label: string; icon: string; al
     group: "Business",
     items: [
       { to: "/crm", label: "CRM & projects", icon: "☺" },
+      { to: "/onboarding", label: "Customer onboarding", icon: "✓" },
       { to: "/quotes", label: "Products & quotes", icon: "❖" },
       { to: "/billing", label: "Agreements & billing", icon: "£" },
     ],
@@ -318,6 +323,7 @@ function Shell() {
             <Route path="/deploy" element={<Deploy />} />
             <Route path="/alerts" element={<Alerts />} />
             <Route path="/protection-health" element={<ProtectionHealth />} />
+            <Route path="/agent-health" element={<AgentHealth />} />
             <Route path="/quarantine" element={<Quarantine />} />
             <Route path="/edr-exclusions" element={<EdrExclusions />} />
             <Route path="/admin-requests" element={<Elevation />} />
@@ -335,6 +341,7 @@ function Shell() {
             <Route path="/attack-surface" element={<AttackSurface />} />
             <Route path="/compliance" element={<Compliance />} />
             <Route path="/crm" element={<Crm />} />
+            <Route path="/onboarding" element={<Onboarding />} />
             <Route path="/crm/accounts/:id" element={<CrmAccount />} />
             <Route path="/service-desk" element={<Navigate to="/service-board" replace />} />
             <Route path="/service-board" element={<ServiceBoard />} />
@@ -359,6 +366,7 @@ function Shell() {
             <Route path="/reports" element={<Reports />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/m365" element={<M365 />} />
+            <Route path="/m365/:connectionId" element={<M365Tenant />} />
             <Route path="/m365-partner" element={<M365Partner />} />
             <Route path="/network" element={<Network />} />
             <Route path="/network-topology" element={<NetworkTopology />} />

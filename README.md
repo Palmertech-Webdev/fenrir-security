@@ -85,7 +85,7 @@ Once this is done you do not need to change anything in the code to run Fenrir. 
 |---|---|
 | Endpoint security | Windows agent, AMSI integration, detection rules, static malware model, alerts, incidents, response, quarantine and DNS protection. Prevention/efficacy limits remain tracked in the parity documents. |
 | RMM | Inventory, metrics, monitoring, scripts, jobs, patching, software deployment, terminal, files and browser remote control. Capabilities differ by endpoint OS. See [stopping commands and removing jobs](docs/COMMAND_CANCELLATION.md). |
-| Microsoft 365 | Customer connections, directory/licence views, security snapshots and reviewed administration. Graph permissions, admin consent and any necessary Microsoft licences are still required. |
+| Microsoft 365 | Overview of every customer tenant; per-tenant workspace (admins, service health, inactive users, permission check); sign-in and audit logs kept for two years; reviewed user, password, MFA, Temporary Access Pass, temporary-admin, group and guest actions; guided onboarding, offboarding and bulk import; GDAP; standards ([scope](docs/M365_ADMINISTRATION_SCOPE.md)). Graph permissions, admin consent and any necessary Microsoft licences are still required. |
 | Exposure | Vulnerability inventory, CVE/EPSS/KEV intelligence, scan ingestion, external assets and remediation tracking. |
 | MSP operations | Customers, service boards, tickets, dispatch, time, projects, CRM, quotes, agreements, billing and client portal. |
 | GRC and operations | [UK and UK-targeted governance programmes](docs/GOVERNANCE.md), policies, evidence, risks, credential vault, network monitoring, backup status and recovery exercises. Actual backup/restore requires a configured provider. |
@@ -391,6 +391,21 @@ The local override keeps HTTP on loopback. Use the same three Compose files for 
 Use incident/job evidence to verify outcomes. Secret reveals and sensitive actions may require password re-entry and are audited. Integrations should use scoped API credentials, not shared administrator tokens.
 
 Where two-person approval is configured, high-impact actions are held for a different authorised operator to review in **Settings → Approvals**. An approval request is not an executed action: check the eventual job/endpoint result.
+
+### Managing customers
+
+Open a customer from **CRM → Accounts**, **Companies** or **Settings → Tenants**. Changing customers needs the `manage_tenants` permission.
+
+- **Edit customer**: name, plan, account owner, default protection policy, phone, website, address and notes.
+- **Archive**: hides the customer from customer lists and stops new devices enrolling. Nothing is deleted. **Restore** brings it
+  back. Archived customers appear when you tick **Show archived**.
+- **Delete**: permanent. Fenrir first shows what will be removed (devices, tickets, invoices, contacts, telemetry and so on). It
+  needs the customer's exact name and your password.
+  - Devices that still report are decommissioned first. Their agents stop reporting but stay installed: uninstall them on the
+    machines (Windows: `fenrir-agent-service.exe --uninstall`).
+  - The audit log keeps its entries about the customer, so its integrity check still holds.
+  - Fenrir's app or GDAP relationship in the customer's Microsoft 365 is not removed.
+  - A customer with sub-customers, the MSP itself and the Unassigned area cannot be deleted.
 
 ### The inbox
 

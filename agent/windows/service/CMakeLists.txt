@@ -151,6 +151,7 @@ add_library(antivirus-agent-core STATIC
   src/RegistryWatcher.cpp
   src/CrashReporter.cpp
   src/SystemProfile.cpp
+  src/ActiveDirectoryOps.cpp
 )
 
 target_include_directories(antivirus-agent-core PUBLIC include ../shared/include ../sensor/etw/include ../sensor/wfp/include)
@@ -172,6 +173,22 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/SystemProfileScript.h.tmp"
   "#pragma once\n// Generated from src/SystemProfileScript.ps1 by CMake. Do not edit.\n"
   "inline const char* const kSystemProfileScriptParts[] = {\n${SYSTEM_PROFILE_CHUNKS}};\n")
 configure_file("${CMAKE_CURRENT_BINARY_DIR}/generated/SystemProfileScript.h.tmp" "${CMAKE_CURRENT_BINARY_DIR}/generated/SystemProfileScript.h" COPYONLY)
+# The Active Directory operations script (src/ActiveDirectoryOpsScript.ps1), embedded the same way.
+set(AD_OPS_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/ActiveDirectoryOpsScript.ps1")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${AD_OPS_SCRIPT}")
+file(READ "${AD_OPS_SCRIPT}" AD_OPS_CONTENT)
+string(LENGTH "${AD_OPS_CONTENT}" AD_OPS_LENGTH)
+set(AD_OPS_CHUNKS "")
+set(AD_OPS_OFFSET 0)
+while(AD_OPS_OFFSET LESS AD_OPS_LENGTH)
+  string(SUBSTRING "${AD_OPS_CONTENT}" ${AD_OPS_OFFSET} 6000 AD_OPS_PART)
+  string(APPEND AD_OPS_CHUNKS "    R\"FENRIRPS(${AD_OPS_PART})FENRIRPS\",\n")
+  math(EXPR AD_OPS_OFFSET "${AD_OPS_OFFSET} + 6000")
+endwhile()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/ActiveDirectoryOpsScript.h.tmp"
+  "#pragma once\n// Generated from src/ActiveDirectoryOpsScript.ps1 by CMake. Do not edit.\n"
+  "inline const char* const kActiveDirectoryOpsScriptParts[] = {\n${AD_OPS_CHUNKS}};\n")
+configure_file("${CMAKE_CURRENT_BINARY_DIR}/generated/ActiveDirectoryOpsScript.h.tmp" "${CMAKE_CURRENT_BINARY_DIR}/generated/ActiveDirectoryOpsScript.h" COPYONLY)
 target_include_directories(antivirus-agent-core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(antivirus-agent-core PUBLIC antivirus-sqlite3 winhttp ole32 oleaut32 bcrypt advapi32 tdh crypt32 wintrust fwpuclnt iphlpapi shell32 ws2_32 wtsapi32 userenv netapi32 urlmon wevtapi)
 antivirus_apply_portable_runtime(antivirus-agent-core)
@@ -397,6 +414,11 @@ file(TO_CMAKE_PATH "${ANTIVIRUS_DEV_TOOLS_OUTPUT_ROOT}/fenrir-amsitestcli.exe" S
 file(TO_CMAKE_PATH "${ANTIVIRUS_DEV_TOOLS_OUTPUT_ROOT}/fenrir-etwtestcli.exe" SETUP_ETWTESTCLI_EXE)
 file(TO_CMAKE_PATH "${ANTIVIRUS_DEV_TOOLS_OUTPUT_ROOT}/fenrir-wfptestcli.exe" SETUP_WFPTESTCLI_EXE)
 file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../signatures/default-signatures.tsv" SETUP_SIGNATURES_FILE)
+file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../signatures/default-signatures-malicious.tsv" SETUP_SIGNATURES_MALICIOUS_FILE)
+file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../signatures/default-signatures-observe.tsv" SETUP_SIGNATURES_OBSERVE_FILE)
+file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../signatures/default-cleanware-signers.tsv" SETUP_SIGNATURES_CLEANWARE_SIGNERS_FILE)
+file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../signatures/default-known-good-hashes.tsv" SETUP_SIGNATURES_KNOWN_GOOD_HASHES_FILE)
+file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../signatures/default-observe-only.tsv" SETUP_SIGNATURES_OBSERVE_ONLY_FILE)
 file(TO_CMAKE_PATH "${ANTIVIRUS_DEV_OUTPUT_ROOT}/driver/AntivirusMinifilter.inf" SETUP_DRIVER_INF_FILE)
 file(TO_CMAKE_PATH "${ANTIVIRUS_DEV_OUTPUT_ROOT}/driver/AntivirusMinifilter.sys" SETUP_DRIVER_SYS_FILE)
 file(TO_CMAKE_PATH "${ANTIVIRUS_DEV_OUTPUT_ROOT}/driver/AntivirusMinifilter.cat" SETUP_DRIVER_CAT_FILE)
@@ -477,6 +499,11 @@ IDR_PAYLOAD_AMSITESTCLI RCDATA \"${SETUP_AMSITESTCLI_EXE}\"\n\
 IDR_PAYLOAD_ETWTESTCLI RCDATA \"${SETUP_ETWTESTCLI_EXE}\"\n\
 IDR_PAYLOAD_WFPTESTCLI RCDATA \"${SETUP_WFPTESTCLI_EXE}\"\n\
 IDR_PAYLOAD_SIGNATURES RCDATA \"${SETUP_SIGNATURES_FILE}\"\n\
+IDR_PAYLOAD_SIGNATURES_MALICIOUS RCDATA \"${SETUP_SIGNATURES_MALICIOUS_FILE}\"\n\
+IDR_PAYLOAD_SIGNATURES_OBSERVE RCDATA \"${SETUP_SIGNATURES_OBSERVE_FILE}\"\n\
+IDR_PAYLOAD_SIGNATURES_CLEANWARE_SIGNERS RCDATA \"${SETUP_SIGNATURES_CLEANWARE_SIGNERS_FILE}\"\n\
+IDR_PAYLOAD_SIGNATURES_KNOWN_GOOD_HASHES RCDATA \"${SETUP_SIGNATURES_KNOWN_GOOD_HASHES_FILE}\"\n\
+IDR_PAYLOAD_SIGNATURES_OBSERVE_ONLY RCDATA \"${SETUP_SIGNATURES_OBSERVE_ONLY_FILE}\"\n\
 ${SETUP_DRIVER_INF_RESOURCE_LINE}\n\
 ${SETUP_DRIVER_README_RESOURCE_LINE}\n\
 ${SETUP_DRIVER_SYS_RESOURCE_LINE}\n\
@@ -496,6 +523,11 @@ set(SETUP_PAYLOAD_DEPENDENCIES
   ${SETUP_ETWTESTCLI_EXE}
   ${SETUP_WFPTESTCLI_EXE}
   ${SETUP_SIGNATURES_FILE}
+  ${SETUP_SIGNATURES_MALICIOUS_FILE}
+  ${SETUP_SIGNATURES_OBSERVE_FILE}
+  ${SETUP_SIGNATURES_CLEANWARE_SIGNERS_FILE}
+  ${SETUP_SIGNATURES_KNOWN_GOOD_HASHES_FILE}
+  ${SETUP_SIGNATURES_OBSERVE_ONLY_FILE}
   ${SETUP_WINPTHREAD_RESOURCE_DEPENDENCY}
 )
 foreach(optional_driver_dependency SETUP_DRIVER_INF_DEPENDENCY SETUP_DRIVER_README_DEPENDENCY)

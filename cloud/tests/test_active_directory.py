@@ -118,3 +118,52 @@ def test_ad_attacks_alert_and_routine_work_does_not(client, admin, tenant):
 
     detail = client.get(f"/api/console/ad/domains/{tenant['id']}/unknown", headers=admin)
     assert detail.status_code == 404  # DC02 sent no profile, so it is not a known DC yet
+
+
+def test_decommissioned_controllers_do_not_count_and_snapshot_problems_are_shown(client, admin, tenant):
+    """Seen on a real domain: a DC deleted and re-enrolled showed "1/2 DC agents online", and a DC whose snapshot failed
+    showed only "waiting for the first directory snapshot"."""
+    role = {"kind": "domain-controller", "domainRole": "Primary domain controller", "domain": "corp.example"}
+    old = enroll(client, admin, tenant, hostname="DC01", os_version="Windows Server 2022 Standard", serial="OLD-DC")
+    client.post(f"/api/v1/devices/{old['deviceId']}/profile", headers=old["headers"], json={"profile": {"role": role}})
+    assert client.delete(f"/api/console/devices/{old['deviceId']}", headers=admin).status_code == 200  # decommission
+    new = enroll(client, admin, tenant, hostname="DC01", os_version="Windows Server 2022 Standard", serial="NEW-DC")
+    problem = {"error": "The ActiveDirectory PowerShell module is not installed on this domain controller, so Fenrir cannot read the "
+                        "directory. Install it (no restart needed): Install-WindowsFeature RSAT-AD-PowerShell"}
+    client.post(f"/api/v1/devices/{new['deviceId']}/profile", headers=new["headers"], json={"profile": {"role": role, "activeDirectory": problem}})
+
+    [domain] = client.get("/api/console/ad/domains", headers=admin).json()
+    assert [a["deviceId"] for a in domain["agents"]] == [new["deviceId"]]
+    assert domain["snapshotAt"] is None and "RSAT-AD-PowerShell" in domain["problems"][0]["problem"]
+
+    partial = {**SNAPSHOT, "collectionErrors": ["group policies: The specified module 'GroupPolicy' was not loaded."]}
+    client.post(f"/api/v1/devices/{new['deviceId']}/profile", headers=new["headers"], json={"profile": {"role": role, "activeDirectory": partial}})
+    detail = client.get(f"/api/console/ad/domains/{tenant['id']}/corp.example", headers=admin).json()
+    assert detail["snapshotAt"] and detail["problems"] == [] and detail["collectionErrors"][0].startswith("group policies:")
+    assert detail["counts"]["users"] == SNAPSHOT["counts"]["users"]
+
+
+def test_a_dc_that_sends_no_directory_says_why(client, admin, tenant):
+    """Seen on a real domain: the page said only "waiting for the first directory snapshot" while the DC's agent was
+    failing to collect its profile, or was an agent too old to read the directory."""
+    role = {"kind": "domain-controller", "domainRole": "Primary domain controller", "domain": "corp.example"}
+    dc = enroll(client, admin, tenant, hostname="DC01", os_version="Windows Server 2022 Standard", serial="DC01")
+    client.post(f"/api/v1/devices/{dc['deviceId']}/profile", headers=dc["headers"], json={"profile": {"role": role}})
+    [domain] = client.get("/api/console/ad/domains", headers=admin).json()
+    assert "too old to read the directory" in domain["problems"][0]["problem"]
+
+    # The agent's own report of a failed profile run, newer than the profile held, is shown with its reason.
+    send(client, dc, [{"eventId": "pf-1", "eventType": "inventory.profile.failed", "source": "rmm",
+                       "summary": "The system profile could not be collected or sent.", "occurredAt": utcnow().isoformat() + "Z",
+                       "payloadJson": json.dumps({"error": "the system profile collector timed out"})},
+                      ad_event("ad.monitor.degraded", {"error": 5})])
+    detail = client.get(f"/api/console/ad/domains/{tenant['id']}/corp.example", headers=admin).json()
+    assert "collector timed out" in detail["problems"][0]["problem"]
+    [agent] = detail["agents"]
+    assert agent["profileFailure"]["error"] == "the system profile collector timed out"
+    assert agent["monitor"]["type"] == "degraded" and agent["monitor"]["detail"] == "5"
+
+    # A good snapshot afterwards clears both.
+    client.post(f"/api/v1/devices/{dc['deviceId']}/profile", headers=dc["headers"], json={"profile": {"role": role, "activeDirectory": SNAPSHOT}})
+    detail = client.get(f"/api/console/ad/domains/{tenant['id']}/corp.example", headers=admin).json()
+    assert detail["problems"] == [] and detail["agents"][0]["profileFailure"] is None and detail["snapshotAt"]

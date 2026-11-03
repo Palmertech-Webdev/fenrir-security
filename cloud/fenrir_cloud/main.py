@@ -28,6 +28,13 @@ from .routers import m365_admin as m365_admin_router
 from .routers import m365 as m365_router, network as network_router, grc as grc_router, backup as backup_router, soc_workflows
 from .routers import documentation as documentation_router
 from .routers import active_directory as ad_router
+from .routers import agent_health as agent_health_router
+from .routers import onboarding as onboarding_router
+from .routers import m365_exchange as m365_exchange_router
+from .routers import m365_signin as m365_signin_router
+from .routers import m365_intune as m365_intune_router
+from .routers import m365_reports as m365_reports_router
+from .routers import m365_collaboration as m365_collaboration_router
 from .routers import grc_programme as grc_programme_router
 from .routers import rollouts as rollouts_router
 from .routers import apikeys as apikeys_router
@@ -36,6 +43,8 @@ from .routers import approvals as approvals_router
 from .routers import exclusions as exclusions_router
 from .routers import exposure_intel as exposure_intel_router
 from .routers import m365_partner as m365_partner_router
+from .routers import m365_workspace as m365_workspace_router
+from .routers import m365_lifecycle as m365_lifecycle_router
 from .routers import condition_packages as condition_packages_router
 from .routers import triage as triage_router
 from .routers import clients as clients_router
@@ -44,6 +53,7 @@ from .routers import defender as defender_router
 from .routers import mobile_apps as mobile_apps_router
 from .routers import web_profile as web_profile_router
 from .routers import oob as oob_router
+from .routers import hybrid as hybrid_router
 from .routers import customization as customization_router
 from .routers import grc_assurance as grc_assurance_router
 from .routers import admin, agent_api, artifacts as artifacts_router, business, crm as crm_router, fleet, portal, protection, service_mgmt, soc
@@ -213,7 +223,8 @@ def _purge_telemetry(db, settings: Settings) -> dict:
 
 def _maintenance_jobs(settings: Settings) -> list[tuple[str, object]]:
     """Hourly jobs, in order."""
-    from . import autodoc, billing_sync, client360, darkweb, defender, grc_automation, m365_partner, m365_standards, tprm, web_profile
+    from . import (autodoc, billing_sync, client360, darkweb, defender, grc_automation, m365_partner, m365_reports, m365_standards, m365_workspace,
+                   tprm, web_profile)
 
     jobs: list[tuple[str, object]] = [("telemetry.retention", lambda db: _purge_telemetry(db, settings))]
     if settings.feed_sync_enabled:
@@ -222,6 +233,7 @@ def _maintenance_jobs(settings: Settings) -> list[tuple[str, object]]:
         jobs.append(("intel.feed", lambda db: log.info("feed sync: %s", sync_feed(db, settings.feed_url, settings.feed_token))))
     jobs += [("m365.partner", m365_partner.tick), ("documentation.auto", autodoc.tick), ("tprm", tprm.tick),
              ("grc.automation", grc_automation.tick), ("darkweb", darkweb.tick), ("m365.standards", m365_standards.tick),
+             ("m365.workspace", m365_workspace.tick), ("m365.reports", m365_reports.send_schedules),
              ("billing.sync", billing_sync.tick), ("clients.health", client360.tick),
              ("defender", defender.tick), ("web.profiles", web_profile.tick)]
     if settings.dns_blocklists_enabled:
@@ -287,7 +299,7 @@ def _poll_msp_mailbox(db) -> None:
 
 def _scheduled_jobs() -> list[tuple[str, int, object]]:
     """(name, every N passes of 30 seconds, job), in the order they run within a pass."""
-    from . import condition_remediation, network, remediation, topology
+    from . import condition_remediation, m365_lifecycle, m365_signin_security, network, remediation, topology
     from .routers import artifacts as artifact_store
     from .routers import backup as backup_health
 
@@ -295,12 +307,16 @@ def _scheduled_jobs() -> list[tuple[str, int, object]]:
         ("rmm", 1, rmm.tick),
         ("psa.timed-workflows", 1, psa.timed_workflows),
         ("remote.expire-sessions", 1, remote.expire_sessions),
+        ("m365.temp-admin-expiry", 2, m365_lifecycle.expire_temp_admins),  # every minute
+        ("m365.workflows-waiting", 2, m365_lifecycle.advance_waiting),  # hybrid AD steps and Entra Connect sync
+        ("m365.signin-protection", 20, m365_signin_security.tick),  # every ten minutes: impossible travel and unusual sign-ins
         ("events.outbox", 1, events.process),  # after the jobs above, so their events go out in the same pass
         ("network", 1, network.tick),
         ("psa.mailbox", 4, _poll_msp_mailbox),  # every two minutes
         ("condition-remediation", 10, condition_remediation.tick),  # every five minutes
         ("backup.health", 10, backup_health.health_tick),
         ("remediation", 20, remediation.tick),  # every ten minutes
+        ("remediation.verify", 20, remediation.verify_tick),  # rescans after fixes; reports fixes not confirmed in a day
         ("topology", 120, topology.tick),  # hourly
         ("artifacts.purge", 120, artifact_store.purge_expired),
         ("audit.checkpoint", 120, audit.daily_checkpoint),  # CORE-06: daily chain-head checkpoint (published to webhooks)
@@ -485,9 +501,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     remote.install_wake_hook()
     for module in (agent_api, admin, fleet, soc, crm_router, business, rmm_router, service_mgmt, psa_router, remote_router, portal):
         app.include_router(module.router)
-    for module in (m365_admin_router, m365_router, network_router, grc_router, backup_router, soc_workflows, ad_router, grc_programme_router,
+    app.include_router(onboarding_router.workspace_router)
+    for module in (m365_admin_router, m365_router, network_router, grc_router, backup_router, soc_workflows, ad_router, agent_health_router, onboarding_router, m365_exchange_router, m365_signin_router, m365_intune_router, m365_reports_router, m365_collaboration_router, grc_programme_router,
                    rollouts_router, apikeys_router, roles_router, approvals_router, exclusions_router,
-                   exposure_intel_router, m365_partner_router, condition_packages_router, triage_router, clients_router, search_router, defender_router, mobile_apps_router):
+                   exposure_intel_router, m365_partner_router, m365_workspace_router, m365_lifecycle_router, condition_packages_router, triage_router, clients_router, search_router, defender_router, mobile_apps_router):
         app.include_router(module.router)
     app.include_router(documentation_router.router)
     app.include_router(m365_router.oauth)
@@ -513,6 +530,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(remote_router.sockets)
     app.include_router(oob_router.router)
     app.include_router(oob_router.agent_router)
+    app.include_router(hybrid_router.router)
+    app.include_router(hybrid_router.agent_router)
     app.include_router(network_router.agent)
     app.include_router(grc_assurance_router.router)
     app.include_router(grc_assurance_router.public)
@@ -594,8 +613,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/downloads/fenrir-android.apk", include_in_schema=False)
     def android_app():
-        # Built by agent/android (./gradlew assembleRelease) and copied here by the deploy script.
+        # Built by agent/android (./gradlew assembleRelease). On a Docker server put it in deploy/releases (mounted
+        # read-only and kept across rebuilds); cloud/downloads works for a server run from source.
+        from . import deployment_installers
+
         target = downloads / "fenrir-android.apk"
+        kept = deployment_installers.SIGNED_RELEASES / "fenrir-android.apk"
+        if not target.is_file() and kept.is_file() and not kept.is_symlink():
+            target = kept
         if not target.is_file():
             return JSONResponse({"detail": "The Android app has not been published on this server yet"}, status_code=404)
         return FileResponse(target, media_type="application/vnd.android.package-archive", filename="fenrir-android.apk",
