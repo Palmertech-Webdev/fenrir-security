@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from .models import Alert, Device, DnsQueryLog, Tenant, utcnow
 
-PROFILE_ID = "uk.co.fenrirsecurity.webprotection"  # one Fenrir profile per device: a new one replaces the old
+PROFILE_ID = "fenrir.webprotection"  # one Fenrir profile per device: a new one replaces the old
 PROFILE_NAMESPACE = uuid.UUID("2f3c7a52-6a51-4b0e-9a8e-6f1f8d3b9c11")
 MEDIA_TYPE = "application/x-apple-aspen-config"
 FILENAME = "Fenrir-web-protection.mobileconfig"

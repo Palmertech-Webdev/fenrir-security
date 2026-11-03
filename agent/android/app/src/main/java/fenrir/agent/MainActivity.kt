@@ -1,4 +1,4 @@
-package uk.co.fenrirsecurity.agent
+package fenrir.agent
 
 import android.Manifest
 import android.app.Activity
@@ -24,10 +24,10 @@ import android.widget.TextView
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
-import uk.co.fenrirsecurity.agent.core.ApiException
-import uk.co.fenrirsecurity.agent.core.ControlPlane
-import uk.co.fenrirsecurity.agent.core.EnrollLink
-import uk.co.fenrirsecurity.agent.core.EnrollTarget
+import fenrir.agent.core.ApiException
+import fenrir.agent.core.ControlPlane
+import fenrir.agent.core.EnrollLink
+import fenrir.agent.core.EnrollTarget
 import java.text.DateFormat
 import java.util.Date
 import kotlin.concurrent.thread

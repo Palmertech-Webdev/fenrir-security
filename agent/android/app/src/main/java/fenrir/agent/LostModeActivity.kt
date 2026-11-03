@@ -1,4 +1,4 @@
-package uk.co.fenrirsecurity.agent
+package fenrir.agent
 
 import android.app.Activity
 import android.content.BroadcastReceiver
@@ -19,7 +19,7 @@ import android.widget.TextView
 /** Shown over the lock screen while the phone is in lost mode: the owner's message and a number to call. */
 class LostModeActivity : Activity() {
     companion object {
-        const val ACTION_CLOSE = "uk.co.fenrirsecurity.agent.CLOSE_LOST_MODE"
+        const val ACTION_CLOSE = "fenrir.agent.CLOSE_LOST_MODE"
     }
 
     private val close = object : BroadcastReceiver() {

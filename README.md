@@ -111,7 +111,7 @@ Built user-mode artifacts include Windows x64, Linux amd64/arm64 and macOS amd64
 For the whole path from a fresh server to the first customer (backups off-site, monitoring, staff access, Windows
 protection, acceptance and rollout), follow the [go-live checklist](docs/GO_LIVE.md).
 
-Clone your own fork in step 2 (see [Start here](#start-here-your-own-copy)); the commands below keep it in `~/AntiVirus`.
+Clone your own fork in step 2 (see [Start here](#start-here-your-own-copy)); the commands below keep it in `~/fenrir`.
 
 These steps are for a **new installation**. On an existing server, preserve its database, configuration and keys and use [Updates](#updates). Never regenerate an existing installation's secrets just to upgrade it.
 
@@ -138,8 +138,32 @@ Point a hostname such as `rmm.example.com` at the VPS. Remove incorrect AAAA/IPv
 ### 2. Clone and configure
 
 ```bash
-git clone https://github.com/YOUR-ACCOUNT/YOUR-FORK.git ~/AntiVirus   # your fork (see Start here)
-cd ~/AntiVirus
+git clone https://github.com/YOUR-ACCOUNT/YOUR-FORK.git ~/fenrir   # your fork (see Start here)
+cd ~/fenrir
+deploy/setup.sh
+```
+
+Setup asks for:
+
+- **Your domain name** (for example `rmm.yourcompany.com`): a DNS A record for it must point at this server. Fenrir is
+  served there over HTTPS, agents and phones connect to it, and its certificate is issued for it automatically.
+- **An administrator email**: your first sign-in, and the contact for the HTTPS certificate.
+- **Your organisation's name**: shown in the console (change it later in Settings).
+- **Whether you have a Windows code-signing certificate**: without one, Windows agents are built unsigned and
+  Windows SmartScreen warns when they run (see [code signing](docs/CODE_SIGNING.md)).
+- **A signature feed URL** (optional): see [components/signaturedb](components/signaturedb/README.md) to run your own.
+
+It writes `deploy/.env` with fresh random secrets, the HTTPS proxy files and the release-signing key, prints the first
+administrator password once, and can build and start Fenrir. It never overwrites an existing `deploy/.env`. For a
+scripted install: `deploy/setup.sh --domain rmm.yourcompany.com --email you@yourcompany.com --name "Your Company" --yes`.
+Steps 3 and 4 below are then done; continue at step 5 with the compose files setup printed (also in
+`deploy/.compose-files`).
+
+<details><summary>Configure by hand instead</summary>
+
+```bash
+git clone https://github.com/YOUR-ACCOUNT/YOUR-FORK.git ~/fenrir   # your fork (see Start here)
+cd ~/fenrir
 (
 umask 077
 mkdir -p deploy/signing deploy/releases
@@ -176,6 +200,8 @@ The public URL must be reachable by browsers and agents. The domain setting is a
 
 Keep `FENRIR_SECRET_KEY` stable: it signs console sessions. The vault key protects stored credentials and recovery secrets; losing it can make those values unreadable. Configure a working threat feed/intelligence source for meaningful protection; a configured URL is not proof that updates have arrived.
 
+</details>
+
 ### 3. Set up signing
 
 Generate the Linux/macOS release key once, retaining any existing key:
@@ -192,7 +218,7 @@ chmod 600 deploy/signing/release-ed25519.pem
 From your workstation, upload the Windows certificate using your SSH account/server:
 
 ```powershell
-scp "C:\path\Certificate.pfx" you@YOUR_SERVER:~/AntiVirus/deploy/signing/codesign.pfx
+scp "C:\path\Certificate.pfx" you@YOUR_SERVER:~/fenrir/deploy/signing/codesign.pfx
 ```
 
 In the server's Bash terminal, enter its password without recording it in shell history:
@@ -221,7 +247,7 @@ cp deploy/Caddyfile.example deploy/Caddyfile
 
 For an existing installation, merge the examples into its current proxy configuration instead of overwriting it. Caddy obtains/renews TLS certificates, redirects HTTP to HTTPS and proxies WebSockets. Its state lives in named volumes. The override replaces the base public HTTP binding with `127.0.0.1:8080`; do not expose PostgreSQL or rely solely on a firewall to hide Docker-published ports.
 
-Define this helper in **each new Bash session**, from `~/AntiVirus`. The production commands below use it:
+Define this helper in **each new Bash session**, from `~/fenrir`. The production commands below use it:
 
 ```bash
 dc() {
@@ -572,7 +598,7 @@ Back up first, and run `sudo deploy/preflight.sh` afterwards. Preserve `.env`, t
 Manual update on the server, for a checkout already following `main`:
 
 ```bash
-cd ~/AntiVirus
+cd ~/fenrir
 git status --short
 git pull --ff-only origin main
 dc build cloud
@@ -659,7 +685,7 @@ Do not use `docker compose down -v` for troubleshooting: it deletes named volume
 
 ## Troubleshooting
 
-Run from `~/AntiVirus` with the deployment's original Compose files and `.env`. Define `dc` again in a new SSH session:
+Run from `~/fenrir` with the deployment's original Compose files and `.env`. Define `dc` again in a new SSH session:
 
 ```bash
 git rev-parse --short HEAD
@@ -671,7 +697,7 @@ curl http://127.0.0.1:8080/health/background
 
 | Symptom | Check / solution |
 |---|---|
-| `fatal: not a git repository` | Run `cd ~/AntiVirus`, then `git status` before fetching. |
+| `fatal: not a git repository` | Run `cd ~/fenrir`, then `git status` before fetching. |
 | `/health/background` returns 503 | Its `problems` list says what stopped. Check `dc ps worker` and `dc logs --tail=200 worker`; `dc restart worker` is safe at any time. A job named under `stuck` is still running after 30 minutes: its log lines say which provider it is waiting on. |
 | `sudo: a password is required` | Use an interactive SSH terminal and an authorised sudo account. Enter its password at the prompt; have the server administrator correct missing access. |
 | 500 on Devices, RMM, patching, dashboard or reports after upgrading | Read the cloud traceback. A missing `devices.agent_build` is repaired by migration 29. Rebuild/restart the updated cloud image; refreshing a browser cannot repair a database. See below. |
@@ -695,7 +721,7 @@ curl http://127.0.0.1:8080/health/background
 If cloud logs show `PermissionError: [Errno 13] Permission denied: '/app/cloud/fenrir_cloud/crypto.py'` (or another packaged module), make the tracked public application files readable and their directories traversable, then rebuild with the existing `dc` helper:
 
 ```bash
-cd ~/AntiVirus
+cd ~/fenrir
 umask 022
 git ls-files -z cloud ml/fenrir_ml ml/models | xargs -0 -r chmod a+r
 find cloud ml/fenrir_ml ml/models -type d -exec chmod a+rx {} +

@@ -1,4 +1,4 @@
-package uk.co.fenrirsecurity.agent
+package fenrir.agent
 
 import android.app.Activity
 import android.app.Notification
@@ -21,7 +21,7 @@ import android.os.UserManager
 import android.provider.Settings
 import org.json.JSONArray
 import org.json.JSONObject
-import uk.co.fenrirsecurity.agent.core.ControlPlane
+import fenrir.agent.core.ControlPlane
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URI

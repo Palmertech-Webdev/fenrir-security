@@ -227,7 +227,7 @@ def _maintenance_jobs(settings: Settings) -> list[tuple[str, object]]:
                    tprm, web_profile)
 
     jobs: list[tuple[str, object]] = [("telemetry.retention", lambda db: _purge_telemetry(db, settings))]
-    if settings.feed_sync_enabled:
+    if settings.feed_sync_enabled and settings.feed_url:  # no feed configured: nothing to pull
         from .intel import sync_feed
 
         jobs.append(("intel.feed", lambda db: log.info("feed sync: %s", sync_feed(db, settings.feed_url, settings.feed_token))))

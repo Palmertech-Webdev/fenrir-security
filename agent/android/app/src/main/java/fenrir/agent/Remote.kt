@@ -1,4 +1,4 @@
-package uk.co.fenrirsecurity.agent
+package fenrir.agent
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
@@ -299,7 +299,7 @@ class ScreenShareActivity : Activity() {
  */
 class ScreenCaptureService : Service() {
     companion object {
-        private const val ACTION_STOP = "uk.co.fenrirsecurity.agent.STOP_SHARING"
+        private const val ACTION_STOP = "fenrir.agent.STOP_SHARING"
         private const val MAX_SIDE = 1280
 
         fun start(context: Context, resultCode: Int, data: Intent) {

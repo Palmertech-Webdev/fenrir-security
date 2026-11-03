@@ -1,4 +1,4 @@
-package uk.co.fenrirsecurity.agent.core
+package fenrir.agent.core
 
 import org.json.JSONObject
 import org.junit.Assert.assertEquals

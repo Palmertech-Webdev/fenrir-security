@@ -1,6 +1,6 @@
 # Fenrir feed service replacement
 
-This replacement turns `api.fenrir-security.co.uk` into a focused Cloudflare-hosted update service for endpoint agents.
+This replacement turns your feed domain (for example `feed.example.com`) into a focused Cloudflare-hosted update service for endpoint agents.
 
 ## What it does
 

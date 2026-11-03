@@ -4,7 +4,7 @@ The server signs every Fenrir Windows program during its image build:
 - the service, the agent window, the remote helper, the privileged-access (PAM) tool and the AMSI provider;
 - then the installer, which embeds those signed copies.
 
-Windows then shows the publisher (for example "Fenrir-Security") instead of "Unknown publisher". Tampered files are also detectable.
+Windows then shows the publisher (the organisation named in your certificate) instead of "Unknown publisher". Tampered files are also detectable.
 
 ## Setting it up (once, on the server)
 
