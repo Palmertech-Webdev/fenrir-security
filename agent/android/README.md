@@ -134,7 +134,7 @@ Company phones can make Fenrir the device owner. This only works on a phone that
 before any account is added:
 
 ```sh
-adb shell dpm set-device-owner uk.co.fenrirsecurity.agent/.FenrirAdminReceiver
+adb shell dpm set-device-owner fenrir.agent/.FenrirAdminReceiver
 ```
 
 At scale, use Android zero-touch or QR provisioning with the same component name.

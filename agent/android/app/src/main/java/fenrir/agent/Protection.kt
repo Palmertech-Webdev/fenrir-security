@@ -1,4 +1,4 @@
-package uk.co.fenrirsecurity.agent
+package fenrir.agent
 
 import android.app.PendingIntent
 import android.app.admin.DevicePolicyManager
@@ -14,9 +14,9 @@ import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import org.json.JSONObject
-import uk.co.fenrirsecurity.agent.core.AppFacts
-import uk.co.fenrirsecurity.agent.core.AppRisk
-import uk.co.fenrirsecurity.agent.core.Assessment
+import fenrir.agent.core.AppFacts
+import fenrir.agent.core.AppRisk
+import fenrir.agent.core.Assessment
 import java.io.File
 import java.security.MessageDigest
 import java.util.UUID

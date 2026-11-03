@@ -1,4 +1,4 @@
-package uk.co.fenrirsecurity.agent
+package fenrir.agent
 
 import android.app.AlarmManager
 import android.app.Application
@@ -15,11 +15,11 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import org.json.JSONObject
-import uk.co.fenrirsecurity.agent.core.ApiException
-import uk.co.fenrirsecurity.agent.core.AppRisk
-import uk.co.fenrirsecurity.agent.core.Command
-import uk.co.fenrirsecurity.agent.core.ControlPlane
-import uk.co.fenrirsecurity.agent.core.LostMode
+import fenrir.agent.core.ApiException
+import fenrir.agent.core.AppRisk
+import fenrir.agent.core.Command
+import fenrir.agent.core.ControlPlane
+import fenrir.agent.core.LostMode
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -55,8 +55,8 @@ class WakeReceiver : BroadcastReceiver() {
  */
 class AgentService : Service() {
     companion object {
-        const val ACTION_CHECK_NOW = "uk.co.fenrirsecurity.agent.CHECK_NOW"
-        const val ACTION_STOP_ALARM = "uk.co.fenrirsecurity.agent.STOP_ALARM"
+        const val ACTION_CHECK_NOW = "fenrir.agent.CHECK_NOW"
+        const val ACTION_STOP_ALARM = "fenrir.agent.STOP_ALARM"
         private const val EXTRA_REASON = "reason"
         private const val TAG = "FenrirAgent"
 

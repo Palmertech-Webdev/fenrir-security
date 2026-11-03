@@ -15,9 +15,7 @@ interface BuildServerOptions {
 
 const DEFAULT_ALLOWED_CORS_ORIGINS = [
   "http://localhost:3000",
-  "http://127.0.0.1:3000",
-  "https://api.fenrir-security.co.uk",
-  "https://av.fenrir-security.co.uk"
+  "http://127.0.0.1:3000"
 ];
 
 const manifestQuerySchema = z.object({

@@ -59,7 +59,7 @@ class Settings:
     open_enrollment: bool = field(default_factory=lambda: _bool("FENRIR_OPEN_ENROLLMENT", True))
 
     # Upstream signature feed (the signaturedb-fenrir Cloudflare worker).
-    feed_url: str = field(default_factory=lambda: os.getenv("FENRIR_FEED_URL", "https://api.fenrir-security.co.uk"))
+    feed_url: str = field(default_factory=lambda: os.getenv("FENRIR_FEED_URL", ""))
     feed_token: str = field(default_factory=lambda: os.getenv("FENRIR_FEED_TOKEN", ""))
     feed_sync_enabled: bool = field(default_factory=lambda: _bool("FENRIR_FEED_SYNC", False))
 

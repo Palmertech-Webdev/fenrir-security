@@ -1,4 +1,4 @@
-package uk.co.fenrirsecurity.agent
+package fenrir.agent
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -33,9 +33,9 @@ import android.provider.Settings
 import android.telephony.TelephonyManager
 import org.json.JSONArray
 import org.json.JSONObject
-import uk.co.fenrirsecurity.agent.core.Fix
-import uk.co.fenrirsecurity.agent.core.Inventory
-import uk.co.fenrirsecurity.agent.core.Iso
+import fenrir.agent.core.Fix
+import fenrir.agent.core.Inventory
+import fenrir.agent.core.Iso
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.CountDownLatch

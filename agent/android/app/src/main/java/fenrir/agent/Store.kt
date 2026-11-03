@@ -1,4 +1,4 @@
-package uk.co.fenrirsecurity.agent
+package fenrir.agent
 
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
@@ -6,8 +6,8 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
-import uk.co.fenrirsecurity.agent.core.Fix
-import uk.co.fenrirsecurity.agent.core.LostMode
+import fenrir.agent.core.Fix
+import fenrir.agent.core.LostMode
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator

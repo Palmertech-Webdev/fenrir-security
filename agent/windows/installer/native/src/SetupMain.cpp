@@ -45,7 +45,8 @@ constexpr wchar_t kMinifilterDefaultInstanceName[] = L"AntivirusMinifilter Insta
 constexpr wchar_t kMinifilterDefaultInstanceAltitude[] = L"370030";
 constexpr wchar_t kAgentRegistryRoot[] = L"SOFTWARE\\FenrirAgent";
 constexpr wchar_t kControlPlaneBaseUrlValueName[] = L"ControlPlaneBaseUrl";
-constexpr wchar_t kDefaultControlPlaneBaseUrl[] = L"https://api.fenrir-security.co.uk";
+// No built-in server: installers from a Fenrir console carry its address (--server) and an enrolment token.
+constexpr wchar_t kDefaultControlPlaneBaseUrl[] = L"";
 constexpr wchar_t kArpRegistryRoot[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FenrirEndpoint";
 constexpr wchar_t kRunRegistryRoot[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValueName[] = L"FenrirEndpointClient";
@@ -2794,6 +2795,12 @@ void RunInstallOrRepairSteps(HWND hwnd, UiContext* context, const bool repair) {
     PostLog(hwnd, L"Preserving existing managed cloud endpoint configuration.");
   } else {
     PostLog(hwnd, L"Preparing customer-managed enrollment for the selected cloud server.");
+  }
+  if (context->controlPlaneBaseUrl.empty()) {
+    FailInstall(hwnd, context, false,
+                L"This installer does not know which Fenrir server to use. Download the installer from your Fenrir console "
+                L"(Deploy agents), or run FenrirSetup.exe --server https://your-server --token <enrolment code>.");
+    return;
   }
   if (!PersistControlPlaneUrl(context->controlPlaneBaseUrl, &errorMessage)) {
     FailInstall(hwnd, context, false, errorMessage);
