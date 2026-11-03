@@ -20,6 +20,13 @@ from .models import AgentRollout, AgentRolloutDevice, Device, Event, utcnow
 STAGES = ("canary", "beta", "stable", "lts")
 SOAK = {"canary": timedelta(hours=2), "beta": timedelta(hours=24), "stable": timedelta(hours=72), "lts": timedelta(0)}
 UPDATE_GRACE = timedelta(minutes=60)  # time a device has to come back on the new build after taking it
+# A device that goes quiet straight after taking a build is the worst failure (it may need a person to bring it back):
+# one silent for SILENT_AFTER that has not checked in since shortly after the offer fails the rollout early.
+SILENT_AFTER = timedelta(minutes=20)
+# Pilot: within each stage the first few devices take the build alone, and the rest wait until those have come back on
+# it and kept checking in for PILOT_SOAK. Fleets that use no rings get a canary this way too.
+PILOT_SOAK = timedelta(minutes=30)
+PILOT_MAX = 5
 
 
 def ring_of(settings: dict) -> int:
@@ -90,6 +97,10 @@ def evaluate(db: Session, rollout: AgentRollout, now: datetime | None = None) ->
             offer.outcome, offer.resolved_at = "updated", now
         elif _rejected(db, device, offer.offered_at):
             offer.outcome, offer.detail, offer.resolved_at = "failed", "the agent refused the update", now
+        elif (now - offer.offered_at > SILENT_AFTER and device.last_seen_at is not None
+              and device.last_seen_at < offer.offered_at + timedelta(minutes=10) and now - device.last_seen_at > SILENT_AFTER):
+            offer.outcome, offer.resolved_at = "failed", now
+            offer.detail = "stopped checking in after taking the update"
         elif now - offer.offered_at > UPDATE_GRACE:
             seen = device.last_seen_at
             offer.outcome, offer.resolved_at = "failed", now
@@ -115,6 +126,31 @@ def evaluate(db: Session, rollout: AgentRollout, now: datetime | None = None) ->
     return rollout
 
 
+def pilot_size(db: Session, platform: str) -> int:
+    from sqlalchemy import func
+
+    fleet = db.execute(select(func.count()).select_from(Device).where(Device.platform == platform,
+                                                                      Device.approved.is_(True))).scalar() or 0
+    return max(1, min(PILOT_MAX, -(-fleet // 10)))
+
+
+def _pilot_wait(db: Session, rollout: AgentRollout, platform: str, now: datetime | None = None) -> str:
+    """Why this stage's other devices must wait for its pilot devices, or "" when they need not."""
+    now = now or utcnow()
+    offers = db.execute(select(AgentRolloutDevice).where(AgentRolloutDevice.rollout_id == rollout.id,
+                                                         AgentRolloutDevice.stage == rollout.stage)).scalars().all()
+    size = pilot_size(db, platform)
+    if len(offers) < size:
+        return ""  # this device joins the pilot
+    pilot = sorted(offers, key=lambda o: o.offered_at)[:size]
+    if any(o.outcome != "updated" for o in pilot):
+        return f"waiting for the first {size} device(s) to come back on the new build"
+    settled = max((o.resolved_at for o in pilot if o.resolved_at), default=now)
+    if now - settled < PILOT_SOAK:
+        return "the first devices updated; waiting for them to keep checking in on the new build before the rest"
+    return ""
+
+
 def _rejected(db: Session, device: Device, since: datetime) -> bool:
     return db.execute(select(Event.id).where(Event.device_id == device.id, Event.event_type == "agent.update.rejected",
                                              Event.received_at >= since).limit(1)).first() is not None
@@ -136,6 +172,10 @@ def offer(db: Session, device: Device, platform: str, build: str, version: str =
         return False, f"waiting for the {STAGES[rollout.stage]} stage to finish (this device is in the {STAGES[ring]} ring)"
     existing = db.execute(select(AgentRolloutDevice).where(AgentRolloutDevice.rollout_id == rollout.id,
                                                            AgentRolloutDevice.device_id == device.id)).scalar_one_or_none()
+    if existing is None and record and ring == rollout.stage:
+        waiting = _pilot_wait(db, rollout, platform)
+        if waiting:
+            return False, waiting
     if existing is None and record:
         db.add(AgentRolloutDevice(rollout_id=rollout.id, device_id=device.id, tenant_id=device.tenant_id, stage=ring))
     return True, ""
@@ -166,3 +206,33 @@ def view(db: Session, rollout: AgentRollout) -> dict:
             "startedAt": rollout.started_at.isoformat() + "Z", "stageStartedAt": rollout.stage_started_at.isoformat() + "Z",
             "devices": counts, "failures": [{"deviceId": o.device_id, "detail": o.detail} for o in offers if o.outcome == "failed"][:50],
             "history": rollout.history or []}
+
+
+def update_status(db: Session, device: Device, platform: str, build: str) -> str:
+    """Read-only, for display: why this device is or is not on the build. Changes nothing (unlike offer)."""
+    from . import services
+
+    if not build:
+        return "This server has no agent build to offer."
+    if device.agent_build == build:
+        return ""
+    try:
+        resolution, _ = services.effective_policy(db, device)
+        settings = resolution["settings"]
+    except Exception:  # noqa: BLE001 - shown as text only
+        settings = {}
+    if not bool((settings.get("updates") or {}).get("autoUpdateAgent", True)):
+        return "Automatic agent updates are turned off in this device's policy (updates.autoUpdateAgent)."
+    rollout = db.execute(select(AgentRollout).where(AgentRollout.platform == platform, AgentRollout.build == build)).scalar_one_or_none()
+    if rollout is not None and rollout.state in ("paused", "stopped"):
+        return f"The agent rollout is {rollout.state}: {rollout.reason or 'see Settings > Agent updates'}. Resume it there."
+    ring = ring_of(settings)
+    if rollout is not None and rollout.state != "complete" and ring > rollout.stage:
+        return f"Waiting for the {STAGES[rollout.stage]} stage of the rollout (this device is in the {STAGES[ring]} ring)."
+    if rollout is not None and rollout.state == "active" and ring == rollout.stage:
+        offered = db.execute(select(AgentRolloutDevice.id).where(AgentRolloutDevice.rollout_id == rollout.id,
+                                                                 AgentRolloutDevice.device_id == device.id)).first()
+        waiting = "" if offered else _pilot_wait(db, rollout, platform)
+        if waiting:
+            return f"Pilot: {waiting}."
+    return "The update is offered; the agent installs it the next time it checks (within about 30 minutes) and restarts."

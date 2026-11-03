@@ -71,12 +71,19 @@ CATALOG: tuple[CommandSpec, ...] = (
                 description="targetPath is the service name; payload action is start, stop or restart."),
     CommandSpec("localadmin.rotate", "Rotate local admin password", "Administration",
                 description="Sets a new random local Administrator password; the old one stays in the history."),
-    CommandSpec("remote.session.start", "Start remote session", "Remote access", platforms=ALL,
-                description="Opened from the Connect button; connects the device to the cloud relay."),
-    CommandSpec("remote.session.end", "End remote session", "Remote access", platforms=ALL),
+    CommandSpec("remote.session.start", "Start remote session", "Remote access", platforms=(*ALL, "android"),
+                description="Opened from the Connect button; connects the device to the cloud relay. Android phones share their "
+                            "screen (the user allows each session) and can be controlled when Fenrir's accessibility service is on."),
+    CommandSpec("remote.session.end", "End remote session", "Remote access", platforms=(*ALL, "android")),
     CommandSpec("remote.backstage.selftest", "Test the backstage desktop", "Remote access",
                 description="Opens the hidden backstage desktop in session 0, shows a test window and Task Manager on it, "
                             "checks the capture works, and cleans up. Nothing appears on the user's screen."),
+    CommandSpec("ad.directory", "Active Directory change", "Identity", permission="configure",
+                description="One allowlisted Active Directory change (create, disable, password, groups, move) or an Entra "
+                            "Connect delta sync, sent by Microsoft 365 onboarding and offboarding for AD-synced users."),
+    CommandSpec("remote.cad.selftest", "Test remote Ctrl+Alt+Del", "Remote access",
+                description="Sends Ctrl+Alt+Del to the signed-in Windows session the way a remote desktop session does, and "
+                            "checks Windows opened its security screen. The user sees that screen: run it when that is fine."),
     CommandSpec("patch.scan", "Scan for missing patches", "Patching", platforms=ALL),
     CommandSpec("patch.install", "Install approved patches", "Patching", platforms=ALL,
                 description="Installs the patch IDs in the payload, then reboots per the patch policy."),
@@ -137,6 +144,8 @@ CATALOG: tuple[CommandSpec, ...] = (
 BY_TYPE = {spec.type: spec for spec in CATALOG}
 # Sent by a person from the device page only: never from automations, monitors, bulk actions or the API's batch paths.
 INTERACTIVE_ONLY = {"device.wipe", "device.lostmode"}
+# Sent only by the feature that owns them, never from a device's command menu or an RMM job.
+SERVER_ONLY = {"amt.wsman", "ad.directory"}
 
 
 def catalog_document() -> list[dict]:

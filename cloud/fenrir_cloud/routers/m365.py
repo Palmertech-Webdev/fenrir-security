@@ -1,7 +1,7 @@
 """Tenant-scoped Microsoft 365 connections and snapshots."""
 from uuid import UUID
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -61,23 +61,75 @@ def replace_secret(connection_id: str, body: SecretInput, request: Request, prin
     db.commit()
     return {"ok": True}
 
+class ConnectionEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    clientId: UUID | None = None
+    clientSecret: str | None = Field(default=None, min_length=1, max_length=10000)
+
+
+@router.patch("/connections/{connection_id}")
+def edit_connection(connection_id: str, body: ConnectionEdit, request: Request, principal: Principal = Depends(current_principal),
+                    db: Session = Depends(get_db)):
+    """Rename a connection, or correct a manual app's application ID and secret (use the secret's Value, not its ID)."""
+    principal.require("configure")
+    row = owned(db, M365Connection, connection_id, principal)
+    changed = []
+    if body.name is not None:
+        row.name, changed = body.name.strip(), [*changed, "name"]
+    if body.clientId is not None or body.clientSecret is not None:
+        if (row.auth_mode or "app") != "app":
+            raise HTTPException(409, "Only a manually registered app has an application ID and secret to edit here. "
+                                     "Use Reconnect to sign in again instead.")
+        require_reauth(request, principal)
+        if body.clientId is not None:
+            row.client_id, changed = str(body.clientId), [*changed, "clientId"]
+        if body.clientSecret is not None:
+            row.credentials_envelope = crypto.encrypt(body.clientSecret.strip(), f"m365:{row.tenant_id}:{row.id}")
+            changed = [*changed, "clientSecret"]
+        row.status, row.last_error = "not_synced", ""
+    row.updated_at = utcnow()
+    audit.record(db, principal.actor, "m365.connection_edited", row.id, row.tenant_id, fields=changed)
+    db.commit()
+    return to_dict(row)
+
+
+@router.delete("/connections/{connection_id}")
+def remove_connection(connection_id: str, request: Request, body: dict = Body(default={}), principal: Principal = Depends(current_principal),
+                      db: Session = Depends(get_db)):
+    """Remove a Microsoft 365 connection from Fenrir: its stored secret, snapshot, collected logs, action and run history.
+    Nothing changes in Microsoft 365; the app registration stays in the tenant until someone deletes it there."""
+    from sqlalchemy import delete as sql_delete, update as sql_update
+    from ..models import M365Action, M365LogEntry, M365StandardRun, M365Workflow
+
+    principal.require("configure")
+    row = owned(db, M365Connection, connection_id, principal)
+    require_reauth(request, principal)
+    if str(body.get("confirmName") or "").strip() != row.name.strip():
+        raise HTTPException(422, "Type the connection's name exactly to confirm.")
+    removed = {}
+    for model in (M365LogEntry, M365Workflow, M365Action, M365StandardRun):
+        removed[model.__tablename__] = db.execute(sql_delete(model).where(model.connection_id == row.id)).rowcount or 0
+    db.execute(sql_update(M365SignIn).where(M365SignIn.connection_id == row.id).values(connection_id=None))
+    name, tenant_id, directory = row.name, row.tenant_id, row.directory_id
+    db.delete(row)
+    audit.record(db, principal.actor, "m365.disconnected", connection_id, tenant_id, name=name, directoryId=directory, removed=removed)
+    db.commit()
+    return {"ok": True, "removed": removed}
+
+
 @router.post("/connections/{connection_id}/sync")
 def sync(connection_id: str, principal: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     principal.require("configure")
     row = owned(db, M365Connection, connection_id, principal)
     ratelimit.check(f"m365-sync:{row.id}", 3, 300)
+    from .. import m365_workspace
+
     try:
-        snapshot = m365.synchronize(row)
-    except (httpx.HTTPError, ValueError, KeyError, crypto.VaultError):
-        # Never return provider bodies, token URLs with secrets, or raw exceptions.
-        row.status, row.last_error = "failed", "Sync failed. Check application credentials, Graph permissions and connectivity."
-        audit.record(db, principal.actor, "m365.sync_failed", row.id, row.tenant_id)
+        m365_workspace.sync_connection(db, row, principal.actor)
+    except ValueError as exc:
         db.commit()
-        raise HTTPException(502, row.last_error)
-    defender = m365.ingest_defender_alerts(db, row, snapshot.pop("defenderAlerts", None))
-    snapshot["defenderAlerts"] = defender
-    row.snapshot, row.status, row.last_error, row.synced_at = snapshot, "synced", "", utcnow()
-    audit.record(db, principal.actor, "m365.synced", row.id, row.tenant_id, users=len(snapshot["users"]), licenses=len(snapshot["licenses"]))
+        raise HTTPException(502, str(exc)) from None
     db.commit()
     return to_dict(row)
 
@@ -218,6 +270,16 @@ def poll_signin(signin_id: str, principal: Principal = Depends(current_principal
         except IntegrityError:
             db.rollback()
             raise HTTPException(409, "This directory is already connected for this customer")
+        except Exception:
+            # Microsoft has the app and its new secret, but Fenrir could not save them: say so rather than stay "provisioning".
+            db.rollback()
+            row = db.get(M365SignIn, signin_id)
+            row.status = "failed"
+            row.error = ("Microsoft finished setting up the Fenrir app, but Fenrir could not save the connection. Check the server log, "
+                         "then sign in again; the unused app secret can be deleted in Entra (App registrations > Fenrir > Certificates & secrets).")
+            row.secret_envelope = None
+            db.commit()
+            raise
         row.secret_envelope = None  # the device code is spent
         audit.record(db, principal.actor, "m365.connected", connection.id, connection.tenant_id, mode="provisioned",
                      signedInAs=made["signedInAs"], missingPermissions=made["missing"])

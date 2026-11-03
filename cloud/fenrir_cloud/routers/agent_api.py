@@ -110,6 +110,8 @@ def enroll(
         raise HTTPException(403, "An enrollment token is required")
 
     tenant = db.get(Tenant, token.tenant_id) if token else _unassigned_tenant(db)
+    if tenant is None or (tenant.settings or {}).get("archived"):
+        raise HTTPException(403, "This customer is archived or deleted; it cannot enrol devices")
     api_key = new_secret("fdk", 32)
     device = None
     target_id = reinstatement_target(raw_token) if token else None
@@ -184,6 +186,14 @@ def rotate_key(device: Device = Depends(current_device), db: Session = Depends(g
     return _key_urls(get_settings(), device, key)
 
 
+@router.post("/devices/{device_id}/presence")
+def presence_check_in(device: Device = Depends(current_device), db: Session = Depends(get_db)):
+    """A bare check-in from an agent whose live connection is down and whose main loop is busy (a scan, a long script):
+    it only keeps the device online. Authenticating it records the check-in."""
+    db.commit()
+    return {"ok": True}
+
+
 @router.post("/devices/{device_id}/heartbeat")
 def heartbeat(body: dict = Body(default={}), device: Device = Depends(current_device), db: Session = Depends(get_db)):
     device.agent_version = str(body.get("agentVersion") or device.agent_version)[:64]
@@ -200,7 +210,11 @@ def heartbeat(body: dict = Body(default={}), device: Device = Depends(current_de
         rmm.evaluate_device(db, device)
     device.metrics = {**(device.metrics or {}), "commandCancellation": body.get("commandCancellation") is True}
     _sync_cmdb_from_agent(db, device)
-    _, policy_doc = services.effective_policy(db, device)
+    resolution, policy_doc = services.effective_policy(db, device)
+    if device.platform == "android" and isinstance(body.get("metrics"), dict):
+        from .. import android_compliance
+
+        android_compliance.record(db, device, body["metrics"], resolution["settings"])
     pending = db.execute(select(func.count()).where(Command.device_id == device.id, Command.status == "pending")).scalar() or 0
     db.commit()
     reply = {"receivedAt": _iso(utcnow()), "effectivePolicyRevision": policy_doc["revision"], "commandsPending": pending,
@@ -310,7 +324,7 @@ def pending_commands(limit: int = Query(default=20, ge=1, le=100), types: str | 
         "polledAt": _iso(now),
         "items": [
             {"id": c.id, "type": c.type, "issuedBy": c.issued_by, "createdAt": _iso(c.created_at), "updatedAt": _iso(c.updated_at),
-             "targetPath": c.target_path, "recordId": c.record_id, "payloadJson": json.dumps(c.payload) if c.payload else ""}
+             "targetPath": c.target_path, "recordId": c.record_id, "payloadJson": json.dumps({k: v for k, v in c.payload.items() if k != "secretEnvelope"}) if c.payload else ""}
             for c in commands
         ],
     }

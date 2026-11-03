@@ -127,6 +127,8 @@ class ControlPlaneClient {
   EnrollmentResult Enroll(const AgentState& state, const std::wstring& enrollmentToken = {}) const;
   // metricsJson: the RMM health object (CPU, memory, disks...) or empty.
   HeartbeatResult SendHeartbeat(const AgentState& state, const std::string& metricsJson = "") const;
+  // A bare "still here" check-in (no state changes), for when the live connection is down and the main loop is busy.
+  void SendPresence(const AgentState& state) const;
   // Asks for a new device API key and returns the command channel URL that carries it. The current key keeps working
   // until the new one is first used, so the caller saves the URL before switching to it.
   std::wstring RotateDeviceKey(const AgentState& state) const;
@@ -138,6 +140,8 @@ class ControlPlaneClient {
   void ReportElevationEvent(const AgentState& state, const std::wstring& requestId, const std::string& bodyJson) const;
   // POST /commands/<id>/amt-credential: the AMT connection details for one amt.wsman command, released once.
   std::string FetchAmtCredential(const AgentState& state, const std::wstring& commandId) const;
+  // POST /commands/<id>/secret: the one-time secret of one ad.directory command ({"secret": "..."}), released once.
+  std::string FetchCommandSecret(const AgentState& state, const std::wstring& commandId) const;
   // POST /profile with the system profile document ({"profile":..., "recoveryKeys":[...]}).
   void SendSystemProfile(const AgentState& state, const std::string& bodyJson) const;
   // ws(s)://.../api/v1/devices/<id>/realtime and the device key that authenticates it.

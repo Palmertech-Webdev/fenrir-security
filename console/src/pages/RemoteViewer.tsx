@@ -7,7 +7,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { api } from "../api";
-import { cadResult, type RemoteFeedback } from "../remote-actions";
+import { cadResult, isScreenSizeMode, SCREEN_SIZE_MODES, screenDisplaySize, type RemoteFeedback, type ScreenSizeMode } from "../remote-actions";
 import { confirmDialog, promptDialog, noticeDialog } from "../components/dialogs";
 
 type Tab = "Desktop" | "Terminal" | "Files" | "Processes" | "Services" | "Chat";
@@ -78,7 +78,17 @@ export default function RemoteViewer() {
   const [quality, setQuality] = useState(70);
   const [maxFps, setMaxFps] = useState(15);
   const [monitor, setMonitor] = useState(0);
-  const [fit, setFit] = useState(true);
+  const [sizeMode, setSizeModeState] = useState<ScreenSizeMode>(() => {
+    try { const saved = localStorage.getItem("fenrir.remote.size"); return isScreenSizeMode(saved) ? saved : "fit"; }
+    catch { return "fit"; }
+  });
+  const setSizeMode = (mode: ScreenSizeMode) => {
+    setSizeModeState(mode);
+    try { localStorage.setItem("fenrir.remote.size", mode); } catch { /* remembered for this window only */ }
+  };
+  const [remoteSize, setRemoteSize] = useState({ w: 1280, h: 720 });
+  const [areaSize, setAreaSize] = useState({ w: 1280, h: 720 });
+  const screenArea = useRef<HTMLDivElement | null>(null);
   const [viewOnly, setViewOnly] = useState(false);
   const [blank, setBlank] = useState(false);
   const [showEnd, setShowEnd] = useState(false);
@@ -285,7 +295,7 @@ export default function RemoteViewer() {
       decodeQueue.current = decodeQueue.current.then(async () => {
         const c = canvas.current;
         if (!c) return;
-        if (c.width !== sw || c.height !== sh) { c.width = sw; c.height = sh; }
+        if (c.width !== sw || c.height !== sh) { c.width = sw; c.height = sh; setRemoteSize({ w: sw, h: sh }); }
         try {
           const bitmap = await createImageBitmap(new Blob([jpeg], { type: "image/jpeg" }));
           c.getContext("2d")!.drawImage(bitmap, x, y);
@@ -308,6 +318,16 @@ export default function RemoteViewer() {
              y: Math.max(0, Math.min(c.height - 1, Math.round(((event.clientY - rect.top) / rect.height) * c.height))) };
   };
   const controlling = state === "live" && !viewOnly && tab === "Desktop";
+  // The picture's on-screen size is set in whole pixels with the remote screen's proportions, so it is never stretched
+  // or squashed and a click lands on the same spot of the remote screen.
+  const shown = screenDisplaySize(sizeMode, remoteSize, areaSize);
+  useEffect(() => {
+    const el = screenArea.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => setAreaSize({ w: el.clientWidth, h: el.clientHeight }));
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [state, tab]);
 
   useEffect(() => {
     let raf = 0;
@@ -444,11 +464,14 @@ export default function RemoteViewer() {
         </nav>
         {tab === "Desktop" && state === "live" && (
           <div className="rv-tools">
+            {caps.includes("nav") && ([["back", "◁ Back"], ["home", "○ Home"], ["recents", "▢ Recents"], ["notifications", "Notifications"]] as const).map(([action, label]) => (
+              <button key={action} title={`Press ${action} on the phone`} disabled={viewOnly} onClick={() => send({ ch: "input", t: "nav", action })}>{label}</button>
+            ))}
             {caps.includes("cad") && <button title="Send Ctrl+Alt+Del" disabled={viewOnly || sendingCad} onClick={requestCad}>{sendingCad ? "Requesting…" : "Ctrl+Alt+Del"}</button>}
             <button title="Paste your clipboard as keystrokes" disabled={viewOnly} onClick={sendClipboard}>Send clipboard</button>
             <select title="Monitor" value={monitor} onChange={(e) => changeScreen({ monitor: Number(e.target.value) })}>
               {(info?.monitors?.length ? info.monitors : [{ index: 0 }]).map((m: any) => (
-                <option key={m.index} value={m.index}>Screen {displayValue(m.index + 1)}{m.primary ? " (primary)" : ""}</option>
+                <option key={m.index} value={m.index}>Screen {displayValue(m.index + 1)}{m.primary ? " (primary)" : ""}{m.w && m.h ? ` · ${m.w}×${m.h}${m.scale && m.scale !== 100 ? ` at ${m.scale}%` : ""}` : ""}</option>
               ))}
               {info?.monitors?.length > 1 && String(info?.os).startsWith("windows") && <option value={-1}>All screens</option>}
             </select>
@@ -458,7 +481,10 @@ export default function RemoteViewer() {
             <select title="Frame rate" value={maxFps} onChange={(e) => changeScreen({ fps: Number(e.target.value) })}>
               {[5, 10, 15, 20, 30].map((f) => <option key={f} value={f}>{f} fps</option>)}
             </select>
-            <button onClick={() => setFit(!fit)}>{fit ? "1:1" : "Fit"}</button>
+            <select title={`Viewer size (the remote screen is ${remoteSize.w} × ${remoteSize.h}; its shape is always kept)`} value={sizeMode}
+                    onChange={(e) => { if (isScreenSizeMode(e.target.value)) setSizeMode(e.target.value); }}>
+              {SCREEN_SIZE_MODES.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
+            </select>
             <label className="rv-check"><input type="checkbox" checked={viewOnly} disabled={!!hello?.viewOnly}
                                                onChange={(e) => { releaseAll(); setViewOnly(e.target.checked); }} /> View only</label>
             {hello?.allowBlank && caps.includes("blank") && (
@@ -501,9 +527,9 @@ export default function RemoteViewer() {
             )}
           </div>
         )}
-        <div className="rv-screen" hidden={tab !== "Desktop" || state !== "live"} style={{ overflow: fit ? "hidden" : "auto" }}>
-          <canvas ref={canvas} width={1280} height={720} tabIndex={0} className={fit ? "fit" : ""}
-                  style={{ cursor: controlling ? "default" : "not-allowed" }}
+        <div className="rv-screen" ref={screenArea} hidden={tab !== "Desktop" || state !== "live"} style={{ overflow: sizeMode === "fit" ? "hidden" : "auto" }}>
+          <canvas ref={canvas} width={1280} height={720} tabIndex={0}
+                  style={{ cursor: controlling ? "default" : "not-allowed", width: shown.w, height: shown.h }}
                   onMouseMove={(e) => { if (controlling) pendingMove.current = toRemote(e); }}
                   onMouseDown={(e) => { if (!controlling) return; e.preventDefault(); canvas.current?.focus(); send({ ch: "input", t: "md", b: e.button, ...toRemote(e) }); }}
                   onMouseUp={(e) => { if (controlling) send({ ch: "input", t: "mu", b: e.button, ...toRemote(e) }); }}

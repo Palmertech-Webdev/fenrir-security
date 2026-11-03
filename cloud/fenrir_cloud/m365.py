@@ -1,4 +1,5 @@
 """Bounded, read-only Microsoft Graph v1.0 synchronisation."""
+import re
 from urllib.parse import urlparse
 import httpx
 from time import monotonic
@@ -48,20 +49,151 @@ def synchronize(connection):
             "managedDevices": "/deviceManagement/managedDevices?$select=id,deviceName,serialNumber,operatingSystem,userPrincipalName,"
                               "complianceState,lastSyncDateTime",
             # Domain.Read.All
-            "domains": "/domains?$select=id,isVerified,isDefault",
+            "domains": "/domains?$select=id,isVerified,isDefault,authenticationType,supportedServices",
+            # Organization.Read.All: the tenant's own name, country and directory sync state
+            "organization": "/organization?$select=id,displayName,countryLetterCode,createdDateTime,onPremisesSyncEnabled,"
+                            "onPremisesLastSyncDateTime,verifiedDomains",
+            # RoleManagement.Read.Directory (or Directory.Read.All): who holds which admin role
+            "directoryRoles": "/directoryRoles?$select=id,displayName,roleTemplateId&$expand=members",
+            # ServiceHealth.Read.All: open Microsoft incidents and advisories
+            "serviceIssues": "/admin/serviceAnnouncement/issues?$filter=isResolved%20eq%20false",
+            # AuditLog.Read.All with Entra ID P1/P2: last sign-in per user (summarised below, not kept per user)
+            "signInActivity": "/users?$select=id,userPrincipalName,accountEnabled,assignedLicenses,userType,createdDateTime,"
+                              "signInActivity&$top=500",
             # SecurityAlert.Read.All (Defender for Endpoint or Business): open alerts, which become Fenrir alerts
             "defenderAlerts": "/security/alerts_v2?$filter=serviceSource%20eq%20'microsoftDefenderForEndpoint'%20and%20status%20ne%20'resolved'"
                               "&$top=200",
         }
+        # The extra reads never fail the sync: each that Microsoft refuses, times out or answers oddly is recorded as
+        # unavailable with its reason (shown on the tenant's Overview), and the next sync asks again.
+        problems = {}
         for key, path in optional.items():
             try:
-                snapshot[key] = collect(client, GRAPH + path, token, deadline)
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code not in (400, 401, 403, 404):
-                    raise
+                snapshot[key] = collect(client, GRAPH + path, token, max(deadline, monotonic() + 30))
+            except (httpx.HTTPError, ValueError) as exc:
                 snapshot[key] = None
+                problems[key] = describe_failure(exc)
+        snapshot["unavailable"] = problems
+        snapshot["inactiveUsers"] = inactive_users(snapshot.pop("signInActivity", None))
+        snapshot["admins"] = admins(snapshot.pop("directoryRoles", None))
+        snapshot["serviceIssues"] = service_issues(snapshot.get("serviceIssues"))
+        snapshot["permissions"] = permission_check(token)
         snapshot["insights"] = insights(snapshot)
         return snapshot
+
+
+def describe_failure(exc: Exception) -> str:
+    """A short, safe account of a failed Microsoft call: Microsoft's own error code and message, never a secret."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        where = "Microsoft sign-in" if response.request.url.host == "login.microsoftonline.com" else \
+            f"Microsoft Graph ({response.request.url.path.removeprefix('/v1.0')})"
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        error = data.get("error")
+        if isinstance(error, dict):  # Graph
+            said = ": ".join(str(x) for x in (error.get("code"), error.get("message")) if x)
+        else:  # the token endpoint: AADSTS code and description, without Microsoft's trace and correlation IDs
+            said = re.split(r"\s*(?:\r?\n|Trace ID:|Correlation ID:|Timestamp:)", str(data.get("error_description") or error or ""))[0]
+        return f"{where} answered HTTP {response.status_code}" + (f": {said[:300]}" if said else "")
+    if isinstance(exc, httpx.TimeoutException):
+        try:
+            return f"Microsoft did not answer in time ({exc.request.url.host}{exc.request.url.path})"
+        except RuntimeError:
+            return "Microsoft did not answer in time"
+    if isinstance(exc, httpx.HTTPError):
+        return f"Could not reach Microsoft: {type(exc).__name__}"
+    return str(exc)[:300]
+
+
+def permission_check(token: str) -> dict:
+    """What this connection's own token allows, feature by feature (m365_permissions.py)."""
+    from datetime import datetime, timezone
+
+    from . import m365_permissions
+
+    mode, granted = m365_permissions.granted_from_token(token)
+    return {"mode": mode, "granted": granted, "features": m365_permissions.report(mode, granted),
+            "checkedAt": datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"}
+
+
+INACTIVE_DAYS = 90
+
+
+def inactive_users(rows: list | None) -> dict | None:
+    """Enabled, licensed members with no sign-in for 90 days (or never, for accounts older than that): the licences an
+    MSP can usually reclaim. None when Microsoft would not say (no P1/P2 or no permission)."""
+    from datetime import datetime, timedelta, timezone
+
+    if rows is None:
+        return None
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=INACTIVE_DAYS)
+
+    def when(value):
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
+        except ValueError:
+            return None
+
+    found = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("accountEnabled") is False or not row.get("assignedLicenses"):
+            continue
+        if row.get("userType") == "Guest":
+            continue
+        activity = row.get("signInActivity") or {}
+        last = max([d for d in (when(activity.get("lastSignInDateTime")), when(activity.get("lastNonInteractiveSignInDateTime"))) if d],
+                   default=None)
+        created = when(row.get("createdDateTime"))
+        if (last and last < cutoff) or (last is None and created and created < cutoff):
+            found.append({"userPrincipalName": row.get("userPrincipalName") or row.get("id") or "",
+                          "lastSignIn": last.isoformat() if last else None,
+                          "days": (now - last).days if last else None, "licences": len(row.get("assignedLicenses") or [])})
+    found.sort(key=lambda r: (r["days"] is not None, -(r["days"] or 0)))
+    return {"days": INACTIVE_DAYS, "count": len(found), "users": found[:500]}
+
+
+def admins(roles: list | None) -> list | None:
+    """Admin role holders: [{role, roleTemplateId, members: [{id, displayName, userPrincipalName, type}]}]."""
+    if roles is None:
+        return None
+    out = []
+    for role in roles:
+        if not isinstance(role, dict):
+            continue
+        members = [{"id": m.get("id"), "displayName": m.get("displayName") or "", "userPrincipalName": m.get("userPrincipalName") or "",
+                    "type": str(m.get("@odata.type") or "").rsplit(".", 1)[-1]} for m in role.get("members") or [] if isinstance(m, dict)]
+        if members:
+            out.append({"role": role.get("displayName") or "", "roleTemplateId": role.get("roleTemplateId") or "", "members": members})
+    out.sort(key=lambda r: (r["roleTemplateId"] != GLOBAL_ADMIN, r["role"]))
+    return out
+
+
+GLOBAL_ADMIN = "62e90394-69f5-4237-9190-012177145e10"
+
+
+def service_issues(rows: list | None) -> list | None:
+    if rows is None:
+        return None
+    keep = ("id", "title", "service", "status", "classification", "feature", "startDateTime", "lastModifiedDateTime", "impactDescription")
+    return [{k: row.get(k) for k in keep} for row in rows if isinstance(row, dict)][:100]
+
+
+# Free, trial and self-service products Microsoft lists with thousands of seats (Power BI free, Power Automate free,
+# Teams Exploratory...). Counting them would bury real unused licences.
+FREE_SKUS = {"FLOW_FREE", "POWER_BI_STANDARD", "POWERAPPS_VIRAL", "POWERAPPS_DEV", "TEAMS_EXPLORATORY", "STREAM", "WINDOWS_STORE",
+             "RIGHTSMANAGEMENT_ADHOC", "MCOPSTNC", "CCIBOTS_PRIVPREV_VIRAL", "POWER_PAGES_VTRIAL_FOR_MAKERS", "DEVELOPERPACK_E5",
+             "MICROSOFT_BUSINESS_CENTER", "PROJECT_MADEIRA_PREVIEW_IW_SKU", "FORMS_PRO", "Microsoft_Teams_Exploratory_Dept"}
+
+
+def paid_sku(sku: dict) -> bool:
+    part = str(sku.get("skuPartNumber") or "")
+    enabled = int(((sku.get("prepaidUnits") or {}).get("enabled")) or 0)
+    return part not in FREE_SKUS and "FREE" not in part.upper() and "TRIAL" not in part.upper() and "VIRAL" not in part.upper() \
+        and enabled < 10000
 
 
 def insights(snapshot: dict) -> dict:
@@ -72,7 +204,7 @@ def insights(snapshot: dict) -> dict:
                                if u.get("accountEnabled") is False and u.get("assignedLicenses"))
     purchased = assigned = 0
     for sku in snapshot.get("licenses") or []:
-        if isinstance(sku, dict):
+        if isinstance(sku, dict) and paid_sku(sku):
             purchased += int(((sku.get("prepaidUnits") or {}).get("enabled")) or 0)
             assigned += int(sku.get("consumedUnits") or 0)
     mfa = None
@@ -88,12 +220,24 @@ def insights(snapshot: dict) -> dict:
     if score and score.get("maxScore"):
         secure = {"current": score.get("currentScore"), "max": score.get("maxScore"),
                   "percent": round(100 * float(score.get("currentScore") or 0) / float(score["maxScore"]))}
+    admin_roles = snapshot.get("admins")
+    admin_info = None
+    if isinstance(admin_roles, list):
+        people = {m.get("id") for r in admin_roles for m in r.get("members") or []}
+        admin_info = {"count": len(people),
+                      "globalAdmins": sorted(m.get("userPrincipalName") or m.get("displayName") or "" for r in admin_roles
+                                             if r.get("roleTemplateId") == GLOBAL_ADMIN for m in r.get("members") or [])[:50]}
+    issues = snapshot.get("serviceIssues")
+    inactive = snapshot.get("inactiveUsers")
     return {"users": len(users), "enabledUsers": len(enabled), "licencesPurchased": purchased, "licencesAssigned": assigned,
             "licencesUnused": max(purchased - assigned, 0), "disabledButLicensed": disabled_licensed[:100],
+            "guests": sum(1 for u in users if u.get("userType") == "Guest"),
+            "admins": admin_info, "serviceIssues": len(issues) if isinstance(issues, list) else None,
+            "inactiveLicensed": inactive.get("count") if isinstance(inactive, dict) else None,
             "mfa": mfa, "secureScore": secure}
 
 
-def access_token(client, connection):
+def access_token(client, connection, scope: str = "https://graph.microsoft.com/.default"):
     if connection.auth_mode == "gdap":
         # Delegated token for the customer tenant through the MSP's GDAP relationship (m365_partner.py). A rotated
         # partner refresh token is saved with the caller's own transaction.
@@ -110,7 +254,8 @@ def access_token(client, connection):
             if partner is None:
                 raise ValueError("No Microsoft partner connection is configured for GDAP")
             try:
-                token = m365_partner.access_token_for(partner, connection.directory_id, client=client)
+                token = m365_partner.access_token_for(partner, connection.directory_id, client=client,
+                                                      **({} if scope.startswith("https://graph.microsoft.com") else {"scope": scope}))
             except m365_partner.PartnerError as exc:
                 raise ValueError(str(exc)) from exc
             if own:
@@ -132,7 +277,7 @@ def access_token(client, connection):
         secret = crypto.decrypt(connection.credentials_envelope, f"m365:{connection.tenant_id}:{connection.id}")
     response = client.post(f"https://login.microsoftonline.com/{connection.directory_id}/oauth2/v2.0/token",
         data={"client_id": client_id, "client_secret": secret,
-              "grant_type": "client_credentials", "scope": "https://graph.microsoft.com/.default"})
+              "grant_type": "client_credentials", "scope": scope})
     response.raise_for_status()
     return response.json()["access_token"]
 
