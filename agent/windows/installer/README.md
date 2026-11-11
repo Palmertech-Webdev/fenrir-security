@@ -6,7 +6,7 @@ What is included:
 
 - `BuildReleaseLayout.ps1` to gather the built binaries, signature bundle, and minifilter payload artifacts into the canonical `agent/windows/out/dev` tree
 - `BuildInstallerBundle.ps1` to build and stage a native `FenrirSetup.exe` installer into `agent/windows/out/install`
-- `GenerateUpdateManifest.ps1` to emit updater manifests in the format consumed by [UpdaterService.cpp](/C:/Users/matt_admin/Documents/GitHub/AntiVirus/agent/windows/service/src/UpdaterService.cpp)
+- `GenerateUpdateManifest.ps1` to emit updater manifests in the format consumed by [UpdaterService.cpp](/agent/windows/service/src/UpdaterService.cpp)
 - `native/` containing the source for the embedded-payload Windows setup application
 
 The staged installer and raw release layout also carry the MinGW thread runtime (`libwinpthread-1.dll`) when the build toolchain requires it, so clean Windows machines do not need a preinstalled GCC runtime to launch the setup EXE or the installed endpoint binaries.
@@ -65,6 +65,5 @@ This is still release scaffolding, not a Microsoft-partner-signed commercial MSI
 
 ## Trust, Recovery, And Lifecycle
 
-- The installer and updater trust chain, anti-downgrade rules, key-rotation model, emergency revocation path, repair lifecycle, uninstall preservation rules, known-good reset mode, and rollback governance are defined in [Production-Readiness-Plan.md](/C:/Users/matt_admin/Documents/GitHub/AntiVirus/agent/windows/docs/Production-Readiness-Plan.md).
-- The companion updater trust template lives at [update-trust.example.json](/C:/Users/matt_admin/Documents/GitHub/AntiVirus/agent/windows/service/update-trust.example.json).
+- The companion updater trust template lives at [update-trust.example.json](/agent/windows/service/update-trust.example.json).
 - The packaged experience is expected to preserve evidence, patch history, and PAM audit by default during upgrade and repair, while uninstall offers preserve-versus-purge choices instead of destructive one-path removal.

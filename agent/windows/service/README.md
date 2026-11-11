@@ -198,7 +198,6 @@ The default sync interval is now 60 seconds when the agent is run in multi-itera
 
 ## Security Boundary And Governance Templates
 
-- [Production-Readiness-Plan.md](/C:/Users/matt_admin/Documents/GitHub/AntiVirus/agent/windows/docs/Production-Readiness-Plan.md) is the canonical design record for the local UI/API security boundary, updater trust chain, recovery lifecycle, storage governance, patch governance, household role model, and release gates.
 - `local-dashboard-security.example.json` defines the named-pipe-first local dashboard transport, ACL, role, origin-check, and session timeout defaults.
 - `update-trust.example.json` defines pinned trust anchors, anti-downgrade rules, package provenance requirements, and channel recovery defaults.
 - `storage-governance.example.json` defines retention, quota, and disk-pressure policy.
@@ -207,9 +206,9 @@ The default sync interval is now 60 seconds when the agent is run in multi-itera
 
 ## Packaging
 
-- Use [BuildReleaseLayout.ps1](/C:/Users/matt_admin/Documents/GitHub/AntiVirus/agent/windows/installer/BuildReleaseLayout.ps1) to stage the built binaries, docs, signature bundle, and optional driver artifacts into `agent/windows/out/dev`.
-- Use [BuildInstallerBundle.ps1](/C:/Users/matt_admin/Documents/GitHub/AntiVirus/agent/windows/installer/BuildInstallerBundle.ps1) to produce a native `FenrirSetup.exe` installer in `agent/windows/out/install`.
-- Use [GenerateUpdateManifest.ps1](/C:/Users/matt_admin/Documents/GitHub/AntiVirus/agent/windows/installer/GenerateUpdateManifest.ps1) to produce an updater manifest consumable by the rollback-aware update service.
+- Use [BuildReleaseLayout.ps1](/agent/windows/installer/BuildReleaseLayout.ps1) to stage the built binaries, docs, signature bundle, and optional driver artifacts into `agent/windows/out/dev`.
+- Use [BuildInstallerBundle.ps1](/agent/windows/installer/BuildInstallerBundle.ps1) to produce a native `FenrirSetup.exe` installer in `agent/windows/out/install`.
+- Use [GenerateUpdateManifest.ps1](/agent/windows/installer/GenerateUpdateManifest.ps1) to produce an updater manifest consumable by the rollback-aware update service.
 - Use `--self-test` against the staged `out/dev` layout before treating a build as promotion-ready.
-- Use [RunPhase2ExitCriteria.ps1](/C:/Users/matt_admin/Documents/GitHub/AntiVirus/agent/windows/tools/scannercli/RunPhase2ExitCriteria.ps1)
+- Use [RunPhase2ExitCriteria.ps1](/agent/windows/tools/scannercli/RunPhase2ExitCriteria.ps1)
   when you want a standalone Phase 2 ransomware pass/fail report that ignores unrelated self-test warnings.

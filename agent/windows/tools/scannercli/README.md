@@ -21,7 +21,7 @@ Current examples:
 .\antivirus-scannercli.exe --json C:\Temp\sample.ps1
 .\antivirus-scannercli.exe --no-telemetry C:\Temp\suspect-folder
 .\antivirus-scannercli.exe --no-remediation C:\Temp\sample-drop
-.\antivirus-scannercli.exe --exclude C:\Users\matt_admin\Documents\GitHub\AntiVirus\agent\windows\service\build C:\Temp\suspect-folder
+.\antivirus-scannercli.exe --exclude C:\src\fenrir\agent\windows\service\build C:\Temp\suspect-folder
 .\antivirus-scannercli.exe --json --realtime-op execute C:\Temp\sample.ps1
 .\antivirus-scannercli.exe --json --realtime-op create C:\Temp\dropper.exe
 .\antivirus-scannercli.exe --json --realtime-op rename C:\Temp\sample.ps1

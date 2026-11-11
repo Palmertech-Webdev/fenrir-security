@@ -10,8 +10,7 @@ without one, what you give up, and how to roll it out.
   add to downloads. A script fetched with `curl` (or pushed by your RMM/MDM) and run with `sudo` never gets that flag,
   and the installer clears it from the agent binary anyway.
 - **Apple Silicon runs it.** Macs with M-series chips refuse arm64 code that has no signature at all. Go's linker gives
-  the agent an ad-hoc signature, and CI checks the binary shipped in every server image still has it
-  (`scripts/ci/check_macho_signature.py`). Intel Macs do not need one.
+  the agent an ad-hoc signature. Intel Macs do not need one.
 - **It checks itself.** The script carries both agent builds inside it, picks the right one with `uname -m`, and refuses
   to install if the SHA-256 does not match. Updates afterwards are verified against your server's own Ed25519 release key.
 - **It runs as a system service.** A LaunchDaemon (`/Library/LaunchDaemons/com.fenrir.agent.plist`) starts the agent

@@ -1,9 +1,9 @@
 # Fenrir Platform: build everything from one place.
-.PHONY: all cloud-test console agents packages run demo clean
+.PHONY: all cloud-test console agents run demo clean
 
 VERSION ?= 1.0.0
 
-all: cloud-test console agents packages
+all: cloud-test console agents
 
 cloud-test:
 	cd cloud && python3 -m pip install -q -r requirements-dev.txt && python3 -m pytest -q
@@ -14,9 +14,6 @@ console:
 agents:
 	$(MAKE) -C agent/linux test agent agent-arm64 VERSION=$(VERSION)
 	mkdir -p cloud/downloads && cp dist/linux/fenrir-agent-linux-* cloud/downloads/
-
-packages: agents
-	packaging/linux/build-deb.sh $(VERSION)
 
 # Local all-in-one: API + console on http://localhost:8080 (SQLite).
 run: console agents

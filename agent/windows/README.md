@@ -41,7 +41,6 @@ The Windows agent is responsible for local prevention, telemetry collection, enf
 
 ## Security And Operations Design
 
-- The formal production-readiness design now lives in [Production-Readiness-Plan.md](/C:/Users/matt_admin/Documents/GitHub/AntiVirus/agent/windows/docs/Production-Readiness-Plan.md).
 - That plan defines the local dashboard security boundary, updater trust chain, recovery model, uninstall and migration lifecycle, storage governance, Windows integration stance, network protection model, external intelligence flow, patch prioritization, PAM safety rails, parser safety, quarantine restore governance, household role model, and release promotion gates.
 - Runtime-facing example policies for local dashboard security, updater trust, storage governance, support bundle export, and release promotion live in `agent/windows/service/` alongside the existing PAM policy template.
 

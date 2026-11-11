@@ -52,7 +52,6 @@ jobs:
       - uses: actions/setup-go@v5
         with: { go-version: "1.27.3" }
       - run: make -C agent/linux test agent agent-arm64
-      - run: packaging/linux/build-deb.sh 1.0.0
       - uses: actions/upload-artifact@v4
         with:
           name: fenrir-linux-agent

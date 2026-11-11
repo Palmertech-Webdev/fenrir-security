@@ -71,7 +71,6 @@ run.
 
 ## 8. Prove it before customers rely on it
 
-- [ ] Run the [acceptance lab](ACCEPTANCE_LAB.md) against your server: a few VMs, one command, plus the hand checks
   (remote desktop and Ctrl+Alt+Del, admin elevation, patching, isolation, switch-port topology).
 - [ ] Put the agent on your own team's machines for a week or two first.
 
