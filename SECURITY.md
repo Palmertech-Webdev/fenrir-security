@@ -1,26 +1,37 @@
 # Security policy
 
-Fenrir controls every device it manages, so a vulnerability in it can matter a lot. Please report one privately.
+Fenrir is free, self-hosted software with **no support, maintenance commitment or service level**. Read this before
+relying on it.
 
 ## Reporting a vulnerability
 
-Use **Report a vulnerability** on this repository's **Security** tab (GitHub private vulnerability reporting). Do not
-open a public issue, discussion or pull request for it.
+Report it privately through this repository's **Security → Report a vulnerability** (GitHub private security advisories),
+not in a public issue. Include the affected component (server, console, Windows/Linux/macOS/Android agent), the version or
+commit, and steps to reproduce.
 
-Include what you can:
+There is no promise of a fix, a reply or a time frame. If the project has been archived, nobody is watching the
+reports: fix it in your own fork and, if you can, tell other users through your fork's advisories.
 
-- the component (cloud server, console, Windows agent, Linux/macOS agent, Android app, installers);
-- the version or commit;
-- how to reproduce it, and what an attacker gains.
+## What is checked automatically
 
-Fenrir is free and maintained on a best-effort basis: there is no promised response time or fix date, and no bug bounty.
+Every change and release runs free tooling, with results under **Security → Code scanning** and in the workflow runs:
 
-## Supported versions
+| Check | Workflow | What it does |
+|---|---|---|
+| CodeQL | `codeql.yml` | Static analysis of Python, TypeScript, Go, C/C++, Kotlin and the workflows themselves (security-extended queries). |
+| OpenSSF Scorecard | `scorecard.yml` | Rates the repository's own practices: pinned actions, branch protection, token permissions, signed releases. |
+| SBOM and dependency scan | `sbom.yml` | SPDX and CycloneDX bills of materials for the whole tree, scanned for known vulnerable dependencies; attached to each release. |
+| Catalogue integrity | `catalogue.yml` | Community apps and scripts must match `catalogue/MANIFEST.sha256`; winget and Homebrew IDs must exist. |
+| Clean-software and stress suites | `acceptance.yml` | Windows and Linux agents on real runners: false positives, crash recovery, server outage, Defender alongside. |
 
-Only the latest commit on `main` receives fixes. Keep your server and agents updated.
+## Running it safely
 
-## Running Fenrir safely
+An RMM/EDR controls every device it manages. Whoever runs a Fenrir server is responsible for it:
 
-The README's "Use at your own risk" section and `docs/GO_LIVE.md` cover the essentials: HTTPS, MFA for every console
-account, a restricted console network list, protected signing and vault keys, off-site backups, and testing changes on a
-small group of devices first.
+- Keep the server patched (`deploy/install-auto-update.sh --stable`) and behind HTTPS.
+- Every console account uses MFA (production mode enforces it); restrict who can reach the console.
+- Keep `deploy/.env` (the vault key) and `deploy/signing/` (code-signing and release keys) offline and backed up. Anyone
+  with the release key can push updates to your agents.
+- Test scripts, patches and policies on a small group of devices first.
+- Installers are signed with a certificate made on your own server, not a public one. Windows SmartScreen may warn on
+  first download; deploy through your RMM, Group Policy or Intune (see `docs/DEPLOY_FROM_YOUR_RMM.md`) to avoid that.

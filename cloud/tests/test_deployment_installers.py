@@ -75,7 +75,8 @@ def test_macos_installer_is_customer_bound_launchdaemon(client, admin, tenant, m
     syntax = subprocess.run(["sh", "-n"], input=script, text=True, capture_output=True, check=False)
     assert syntax.returncode == 0, syntax.stderr
     assert "/Library/LaunchDaemons/com.fenrir.agent.plist" in script
-    assert "launchctl bootstrap system" in script
+    assert script.index("launchctl enable system/com.fenrir.agent") < script.index("launchctl bootstrap system")
+    assert "kickstart -k" not in script
     assert "shasum -a 256 -c -s" in script
     assert "fet_" in script and "Full Disk Access" in script
     for arch in ("amd64", "arm64"):
@@ -229,3 +230,18 @@ def test_installers_keep_a_configured_proxy_on_repair(client, admin, tenant, mon
         script = result.content.decode()
         assert subprocess.run(["sh", "-n"], input=script, text=True, capture_output=True).returncode == 0
         assert kept in script and written in script and "--proxy" in script
+
+
+def test_signature_reports_the_signing_method(monkeypatch, tmp_path):
+    monkeypatch.setattr(installers, "DOWNLOADS", tmp_path)
+    (tmp_path / "windows").mkdir()
+    manifest = tmp_path / "windows" / "build.json"
+    manifest.write_text('{"signed": true, "signer": "CN=Example Ltd", "timestamped": true}')
+    assert installers.windows_signature()["method"] == "pfx"  # builds from before the method was recorded
+    assert "self-signed" in installers._windows_warning("signed")
+    manifest.write_text('{"signed": true, "signer": "CN=Example Ltd", "timestamped": true, "method": "azure-trusted-signing"}')
+    assert installers.windows_signature()["method"] == "azure-trusted-signing"
+    warning = installers._windows_warning("signed")
+    assert "Azure Trusted Signing" in warning and "self-signed" not in warning
+    manifest.write_text('{"signed": false}')
+    assert installers.windows_signature()["method"] == ""

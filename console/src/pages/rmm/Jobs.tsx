@@ -1,6 +1,6 @@
 import { displayValue } from "../../components/DisplayValue";
 import { useEffect, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { ago, api, fmtTime } from "../../api";
 import { useApp } from "../../app-context";
 import { describeTargets, emptyTargets, JobDetail, JobStatus, TargetPicker, Targets } from "../../components/rmm";
@@ -18,8 +18,8 @@ export default function Jobs() {
   return (
     <>
       <PageHead title="Jobs & schedules" subtitle="Every script, patch and deployment job, plus schedules that run them for you." />
-      <Tabs tabs={["Activity", "Scheduled tasks"]} active={tab} onChange={setTab} />
-      {tab === "Activity" ? (
+      <Tabs tabs={["Activity", "Remote actions", "Scheduled tasks"]} active={tab} onChange={setTab} />
+      {tab === "Remote actions" ? <RemoteActionLog /> : tab === "Activity" ? (
         <div className="card">
           <Table rows={data} onRow={(j) => setJobId(j.id)} empty="No jobs yet. Run a script or deploy software to start one."
                  columns={[{ key: "name", label: "Job", render: (j) => <><b>{displayValue(j.name)}</b><div className="small muted">{displayValue(j.commandType)}</div></> },
@@ -34,6 +34,43 @@ export default function Jobs() {
   );
 }
 
+// Every single command sent to any device (isolation, scans, scripts, phone actions...), not only jobs.
+function RemoteActionLog() {
+  const { tenantId, can } = useApp();
+  const [status, setStatus] = useState("");
+  const [mine, setMine] = useState(false);
+  const [type, setType] = useState("");
+  const { data, reload } = useListData<any>("commands", { tenant_id: tenantId, status, type, issued_by: mine ? "me" : "" });
+  const { data: catalog } = useListData<any>("commands/catalog");
+  const label = (t: string) => catalog?.find((c) => c.type === t)?.label ?? t;
+  const { run, busy } = useAction();
+  useEffect(() => { const t = window.setInterval(reload, 10000); return () => window.clearInterval(t); }, [reload]);
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 10, gap: 8, flexWrap: "wrap" }}>
+        <select value={status} onChange={(e) => setStatus(e.target.value)} aria-label="Status">
+          <option value="">Any status</option><option value="open">Waiting or running</option><option value="completed">Completed</option>
+          <option value="failed">Failed</option><option value="cancelled">Cancelled</option><option value="expired">Expired</option>
+        </select>
+        <select value={type} onChange={(e) => setType(e.target.value)} aria-label="Action">
+          <option value="">Any action</option>{catalog?.map((c) => <option key={c.type} value={c.type}>{displayValue(c.label)}</option>)}
+        </select>
+        <label className="small"><input type="checkbox" checked={mine} onChange={(e) => setMine(e.target.checked)} /> Sent by me</label>
+        <span className="small muted">The latest 500</span>
+      </div>
+      <Table rows={data} empty="No remote actions match."
+             columns={[{ key: "createdAt", label: "Queued", render: (r) => <span title={fmtTime(r.createdAt)}>{ago(r.createdAt)}</span> },
+                       { key: "hostname", label: "Device", render: (r) => <Link to={`/devices/${r.deviceId}?tab=activity&sub=Remote%20actions`}>{displayValue(r.hostname || r.deviceId)}</Link> },
+                       { key: "type", label: "Action", render: (r) => <span title={r.type}>{displayValue(label(r.type))}</span> },
+                       { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
+                       { key: "issuedBy", label: "By", render: (r) => <span className="small">{displayValue(r.issuedBy)}</span> },
+                       { key: "reason", label: "Reason", render: (r) => <span className="small">{displayValue(r.reason || r.targetPath || "")}</span> },
+                       { key: "stop", label: "", render: (r) => can("respond") && ["pending", "dispatched"].includes(r.status) &&
+                           <button className="small danger" disabled={busy} onClick={async () => { if (await run(() => api(`commands/${r.id}/cancel`, { method: "POST" }), "Cancellation requested")) reload(); }}>Stop</button> }]} />
+    </div>
+  );
+}
+
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 function describeSchedule(s: any) {
@@ -41,7 +78,7 @@ function describeSchedule(s: any) {
   switch (s.type) {
     case "interval": return `Every ${s.everyMinutes} min`;
     case "daily": return `Daily at ${s.at}`;
-    case "weekly": return `${(s.days || []).map((d: number) => DAYS[d]).join(", ")} at ${s.at}`;
+    case "weekly": return `${(s.days ?? [0]).map((d: number) => DAYS[d]).join(", ")} at ${s.at}`;
     case "monthly": return `Day ${s.dayOfMonth} of each month at ${s.at}`;
     case "once": return `Once on ${s.date} at ${s.at}`;
   }
@@ -49,16 +86,16 @@ function describeSchedule(s: any) {
 }
 
 function ScheduledTasks() {
-  const { can, tenantName } = useApp();
-  const { data, reload } = useListData<any>("rmm/tasks");
+  const { can, tenantName, tenantId } = useApp();
+  const { data, reload } = useListData<any>("rmm/tasks", { tenant_id: tenantId });
   const [editing, setEditing] = useState<any>(null);
   const { run } = useAction();
   return (
     <>
       <div className="row" style={{ marginBottom: 12 }}>
-        <span className="muted small">Schedules run in the cloud. Offline devices pick their actions up when they reconnect.</span>
+        <span className="muted small">Schedules run in the cloud. Each schedule controls whether offline devices are included.</span>
         <span style={{ flex: 1 }} />
-        {can("configure") && <button className="primary" onClick={() => setEditing({ name: "", schedule: { type: "daily", at: "02:00", tz: Intl.DateTimeFormat().resolvedOptions().timeZone }, targets: emptyTargets(), actions: [], enabled: true })}>New schedule</button>}
+        {can("configure") && <button className="primary" onClick={() => setEditing({ tenantId, name: "", schedule: { type: "daily", at: "02:00", tz: Intl.DateTimeFormat().resolvedOptions().timeZone }, targets: emptyTargets(), actions: [], enabled: true })}>New schedule</button>}
       </div>
       <div className="card">
         <Table rows={data} onRow={setEditing} empty="No scheduled tasks."
@@ -83,7 +120,7 @@ function TaskEditor({ task, onClose }: { task: any; onClose: () => void }) {
   const schedule = form.schedule || {};
   const setSchedule = (patch: any) => setForm({ ...form, schedule: { ...schedule, ...patch } });
   const save = async () => {
-    const body = { name: form.name, schedule: form.schedule, targets: form.targets, actions: form.actions, enabled: form.enabled };
+    const body = { tenantId: form.tenantId, runOfflineOnReconnect: form.runOfflineOnReconnect !== false, name: form.name, schedule: form.schedule, targets: form.targets, actions: form.actions, enabled: form.enabled };
     if (await run(() => (form.id ? api(`rmm/tasks/${form.id}`, { method: "PATCH", body }) : api("rmm/tasks", { body })), "Schedule saved")) onClose();
   };
   const setAction = (i: number, patch: any) => setForm({ ...form, actions: form.actions.map((a: any, j: number) => (i === j ? { ...a, ...patch } : a)) });
@@ -97,14 +134,15 @@ function TaskEditor({ task, onClose }: { task: any; onClose: () => void }) {
           {["daily", "weekly", "monthly", "interval", "once"].map((t) => <option key={t}>{t}</option>)}</select></label>
         {schedule.type === "interval" ? <label className="field">Every (minutes)<input type="number" min={5} value={schedule.everyMinutes || 60} onChange={(e) => setSchedule({ everyMinutes: Number(e.target.value) })} /></label>
           : <label className="field">At<input type="time" value={schedule.at || "02:00"} onChange={(e) => setSchedule({ at: e.target.value })} /></label>}
-        {schedule.type === "monthly" && <label className="field">Day of month<input type="number" min={1} max={28} value={schedule.dayOfMonth || 1} onChange={(e) => setSchedule({ dayOfMonth: Number(e.target.value) })} /></label>}
+        {schedule.type === "monthly" && <label className="field">Day of month<input type="number" min={1} max={31} value={schedule.dayOfMonth || 1} onChange={(e) => setSchedule({ dayOfMonth: Number(e.target.value) })} /></label>}
         {schedule.type === "once" && <label className="field">Date<input type="date" value={schedule.date || ""} onChange={(e) => setSchedule({ date: e.target.value })} /></label>}
+        <label><input type="checkbox" checked={form.runOfflineOnReconnect !== false} onChange={(e) => setForm({ ...form, runOfflineOnReconnect: e.target.checked })} /> Include offline devices when they reconnect</label>
         <label className="field">Time zone<input value={schedule.tz || "UTC"} onChange={(e) => setSchedule({ tz: e.target.value })} /></label>
         <label className="field">Enabled<select value={form.enabled ? "yes" : "no"} onChange={(e) => setForm({ ...form, enabled: e.target.value === "yes" })}><option value="yes">Yes</option><option value="no">Paused</option></select></label>
       </div>
       {schedule.type === "weekly" && <div className="row" style={{ marginTop: 8 }}>
-        {DAYS.map((d, i) => <label key={d} className="small"><input type="checkbox" checked={(schedule.days || []).includes(i)}
-          onChange={() => setSchedule({ days: (schedule.days || []).includes(i) ? schedule.days.filter((x: number) => x !== i) : [...(schedule.days || []), i] })} /> {d}</label>)}
+        {DAYS.map((d, i) => <label key={d} className="small"><input type="checkbox" checked={(schedule.days ?? [0]).includes(i)}
+          onChange={() => setSchedule({ days: (schedule.days ?? [0]).includes(i) ? (schedule.days ?? [0]).filter((x: number) => x !== i) : [...(schedule.days ?? [0]), i] })} /> {d}</label>)}
       </div>}
       <h3 style={{ marginTop: 14 }}>Actions</h3>
       {form.actions.map((a: any, i: number) => (

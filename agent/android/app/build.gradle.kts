@@ -16,12 +16,11 @@ val signing = Properties().apply {
 }
 
 android {
-    namespace = "fenrir.agent"
+    namespace = "uk.co.fenrirsecurity.agent"
     compileSdk = 35
 
     defaultConfig {
-        // Publishing your own build? Set FENRIR_ANDROID_APPLICATION_ID to an ID you own (for example com.yourcompany.fenrir).
-        applicationId = System.getenv("FENRIR_ANDROID_APPLICATION_ID") ?: "fenrir.agent"
+        applicationId = "uk.co.fenrirsecurity.agent"
         minSdk = 26
         targetSdk = 35
         versionCode = (System.getenv("FENRIR_ANDROID_VERSION_CODE") ?: "1").toInt()
@@ -50,11 +49,14 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
     buildFeatures { buildConfig = true }
     // The first CI builds report lint findings (uploaded with the APK) without failing; make it strict once clean.
     lint { abortOnError = false; checkReleaseBuilds = false }
     testOptions { unitTests.isReturnDefaultValues = true }
+}
+
+kotlin {
+    compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
 }
 
 dependencies {

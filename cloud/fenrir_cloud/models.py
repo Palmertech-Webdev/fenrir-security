@@ -125,6 +125,12 @@ class Device(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("dev"))
     tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id"), index=True)
     group_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    # How the device got its group (group_rules.py): the group's id when rules placed it, "manual" when a person did.
+    group_rule_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reinstall_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    health_reported_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    command_poll_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    telemetry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     hostname: Mapped[str] = mapped_column(String(255))
     platform: Mapped[str] = mapped_column(String(20), default="windows")
     os_version: Mapped[str] = mapped_column(String(255), default="")
@@ -156,6 +162,8 @@ class Device(Base):
     exposure_flags: Mapped[list | None] = mapped_column(JSON, nullable=True)
     # Phones: lost mode ({"enabled", "message", "phone", "since", "by"}); the agent re-reads it on every heartbeat.
     lost_mode: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
+    # Phones looked after by family or carers (care.py): tracking level, carers, quiet/battery alerts, escalation, SOS.
+    care: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     # CORE-04 key rotation (devicekeys.py): the new key until its first use, when the key was last rotated, and a
     # technician's request to rotate at the next heartbeat.
     pending_api_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None)
@@ -243,6 +251,45 @@ class DeviceLocation(Base):
     battery_percent: Mapped[int | None] = mapped_column(Integer, nullable=True)
     recorded_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     received_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class Geofence(Base):
+    """A safe zone for one phone: a circle, and whether leaving or arriving raises an alert (with active hours)."""
+
+    __tablename__ = "geofences"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("geo"))
+    tenant_id: Mapped[str] = mapped_column(String(32), index=True)
+    device_id: Mapped[str] = mapped_column(String(32), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    latitude: Mapped[float] = mapped_column(Float)
+    longitude: Mapped[float] = mapped_column(Float)
+    radius_m: Mapped[float] = mapped_column(Float, default=200)
+    alert_on: Mapped[str] = mapped_column(String(10), default="exit")  # exit | enter | both
+    schedule: Mapped[dict] = mapped_column(JSON, default=dict)  # {} = always, or {"days": [0-6, Monday=0], "start": "HH:MM", "end": "HH:MM"}
+    severity: Mapped[str] = mapped_column(String(10), default="high")
+    notify: Mapped[dict] = mapped_column(JSON, default=dict)  # {"users": [user ids for push], "emails": [...], "phone": bool}
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    state: Mapped[str] = mapped_column(String(10), default="unknown")  # inside | outside | unknown
+    state_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_alert_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(200), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class PushSubscription(Base):
+    """A browser or installed console app that receives push notifications for one user (Web Push, RFC 8030)."""
+
+    __tablename__ = "push_subscriptions"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("psh"))
+    user_id: Mapped[str] = mapped_column(String(32), index=True)
+    endpoint: Mapped[str] = mapped_column(String(1000), unique=True)
+    p256dh: Mapped[str] = mapped_column(String(200))
+    auth: Mapped[str] = mapped_column(String(100))
+    label: Mapped[str] = mapped_column(String(200), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    failures: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class DeviceProfile(Base):
@@ -603,6 +650,8 @@ class ClientReport(Base):
     kind: Mapped[str] = mapped_column(String(20))  # monthly | quarterly
     period: Mapped[str] = mapped_column(String(10))  # 2026-09 | 2026-Q3
     html: Mapped[str] = mapped_column(Text)
+    # The same report as structured data (report_render), so it can also be downloaded as a PDF exactly as sent.
+    document: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_by: Mapped[str] = mapped_column(String(200), default="system")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
@@ -1085,6 +1134,7 @@ class ConditionState(Base):
     tenant_id: Mapped[str] = mapped_column(String(32), index=True)
     failing_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     triggered: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_observed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_value: Mapped[float | None] = mapped_column(Float, nullable=True)
     message: Mapped[str] = mapped_column(String(300), default="")
     alert_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -2116,6 +2166,23 @@ class DnsBlocklist(Base):
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_error: Mapped[str] = mapped_column(String(500), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class IntelFeed(Base):
+    """A free threat-intelligence feed the server pulls itself (threat_feeds.py): abuse.ch, IPsum and the like.
+    Its indicators live in ``indicators`` with source ``feed:<id>`` and are replaced on every successful sync."""
+    __tablename__ = "intel_feeds"
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200))
+    url: Mapped[str] = mapped_column(String(500))
+    description: Mapped[str] = mapped_column(String(500), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    refresh_hours: Mapped[int] = mapped_column(Integer, default=1)
+    indicator_count: Mapped[int] = mapped_column(Integer, default=0)
+    etag: Mapped[str] = mapped_column(String(200), default="")
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(String(500), default="")
 
 
 class EdrExclusion(Base):

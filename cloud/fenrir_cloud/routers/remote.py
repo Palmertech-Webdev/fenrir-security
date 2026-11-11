@@ -143,7 +143,8 @@ def mint_viewer_token(session_id: str, principal: Principal = Depends(current_pr
     session = _owned_session(db, principal, session_id)
     if session.status in {"ended", "failed", "denied"}:
         raise HTTPException(409, f"Session {session.status}")
-    return {"token": remote.viewer_token(session, principal.actor, principal.session_id), "path": f"/ws/remote/{session.id}/viewer"}
+    return {"token": remote.viewer_token(session, principal.actor, principal.session_id), "path": f"/ws/remote/{session.id}/viewer",
+            "iceServers": remote.ice_servers()}
 
 
 @router.post("/sessions/{session_id}/end")
@@ -437,15 +438,17 @@ async def device_realtime(websocket: WebSocket, device_id: str, key: str | None 
     await websocket.accept()
     peer = remote.Peer(websocket, actor=f"device:{device_id}")
     remote.hub.register_device(device_id, peer)
-    await peer.send(json.dumps({"type": "hello", "pollNow": True}))
     last_touch = time.monotonic()
     try:
+        if not await peer.send(json.dumps({"type": "hello", "pollNow": True})):
+            return
         while True:
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
                 break
             if (message.get("text") or "").strip() == "ping":
-                await peer.send("pong")
+                if not await peer.send("pong"):
+                    break
                 if time.monotonic() - last_touch >= presence.TOUCH_EVERY.total_seconds():
                     last_touch = time.monotonic()
                     try:

@@ -80,6 +80,13 @@ def effective_policy(db: Session, device: Device) -> tuple[dict, dict]:
     tenant = db.get(Tenant, device.tenant_id)
     layers = policy_layers(db, tenant, device=device)
     resolution = policy_schema.resolve(layers)
+    experience = resolution["settings"].get("experience") or {}
+    if experience.get("brandName") in (None, "", "Fenrir"):  # left at the default: show the MSP's own brand
+        from . import branding
+
+        brand = branding.get(db, device.tenant_id)
+        if brand["customised"]:
+            resolution["settings"]["experience"] = {**experience, "brandName": brand["companyName"]}
     name = layers[-1].name if layers else "Fenrir baseline"
     doc = policy_schema.to_agent_policy(policy_id=device.policy_id or (tenant.default_policy_id if tenant else None) or GLOBAL_POLICY_ID,
                                         name=name, settings=resolution["settings"], botnet_ips=botnet_ips(db, device.tenant_id),
@@ -160,6 +167,10 @@ def enqueue_command(
         resolution, _ = effective_policy(db, device)
         if not resolution["settings"]["privilege"].get("breakGlassAllowed", True):
             raise CommandError("The break-glass admin account is turned off by this device's policy")
+    if command_type == "script.run":
+        resolution, _ = effective_policy(db, device)
+        if not resolution["settings"]["response"].get("scriptExecution", True):
+            raise CommandError("Script execution is turned off by device policy")
     # Don't stack identical pending actions (e.g. two auto-isolations). Different payloads (another remote
     # session, a script with other parameters) are different actions.
     for existing in db.execute(

@@ -1,4 +1,5 @@
 import M365 from "./pages/M365";
+import { BrandHeader, useBrand } from "./brand";
 import M365Partner from "./pages/M365Partner";
 import M365Tenant from "./pages/M365Tenant";
 import Network from "./pages/Network";
@@ -9,7 +10,7 @@ import Governance from "./pages/Governance";
 import Assurance from "./pages/grc/Assurance";
 import Backup from "./pages/Backup";
 import SocWorkflows from "./pages/SocWorkflows";
-import { FormEvent, lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { FormEvent, lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useApp } from "./app-context";
 import { PageBoundary } from "./components/PageBoundary";
@@ -38,6 +39,7 @@ import CrmAccount from "./pages/CrmAccount";
 import Onboarding from "./pages/Onboarding";
 import Billing from "./pages/Billing";
 import Portal from "./pages/Portal";
+import Care from "./pages/Care";
 
 const RemoteViewer = lazy(() => import("./pages/RemoteViewer"));
 import Scripts from "./pages/rmm/Scripts";
@@ -76,17 +78,17 @@ import { api, setDefaultCurrency } from "./api";
 // `also`: other pages of the same section (they switch with section tabs), so the entry stays highlighted on them.
 // Grouped by the job in hand rather than by module: work the queue, look after a client, look after their endpoints,
 // their identity and cloud, run the service desk and the business, prove compliance, then administration.
-const NAV: { group: string; items: { to: string; label: string; icon: string; also?: string[] }[] }[] = [
+const NAV: { group: string; items: { to: string; label: string; icon: string; also?: string[]; module?: string }[] }[] = [
   {
     group: "Triage",
     items: [
       { to: "/", label: "Dashboard", icon: "◎" },
       { to: "/inbox", label: "Inbox", icon: "☰" },
       { to: "/alerts", label: "Alerts", icon: "△" },
-      { to: "/incidents", label: "Incidents", icon: "⚑" },
-      { to: "/admin-requests", label: "Admin requests", icon: "⇡" },
-      { to: "/hunt", label: "Threat hunting", icon: "⌕" },
-      { to: "/intel", label: "Threat intel", icon: "✦" },
+      { module: "security", to: "/incidents", label: "Incidents", icon: "⚑" },
+      { module: "security", to: "/admin-requests", label: "Admin requests", icon: "⇡" },
+      { module: "security", to: "/hunt", label: "Threat hunting", icon: "⌕" },
+      { module: "security", to: "/intel", label: "Threat intel", icon: "✦" },
     ],
   },
   {
@@ -94,15 +96,16 @@ const NAV: { group: string; items: { to: string; label: string; icon: string; al
     items: [
       { to: "/companies", label: "Companies", icon: "⌂" },
       { to: "/reports", label: "Reports", icon: "▤" },
-      { to: "/configurations", label: "Configurations", icon: "⚿" },
-      { to: "/knowledge", label: "Knowledge base", icon: "❏" },
-      { to: "/vault", label: "Credential vault", icon: "⚿" },
+      { module: "documentation", to: "/configurations", label: "Configurations", icon: "⚿" },
+      { module: "documentation", to: "/knowledge", label: "Knowledge base", icon: "❏" },
+      { module: "documentation", to: "/vault", label: "Credential vault", icon: "⚿" },
     ],
   },
   {
     group: "Endpoints",
     items: [
       { to: "/devices", label: "Devices", icon: "▣" },
+      { module: "care", to: "/care", label: "Care", icon: "♡" },
       { to: "/groups", label: "Device groups", icon: "⧉" },
       { to: "/monitoring", label: "Monitoring", icon: "♥" },
       { to: "/patching", label: "Patching", icon: "⟳" },
@@ -110,59 +113,63 @@ const NAV: { group: string; items: { to: string; label: string; icon: string; al
       { to: "/scripts", label: "Scripts", icon: "❯" },
       { to: "/remediation-packages", label: "Remediation packages", icon: "✚" },
       { to: "/automation", label: "Jobs & schedules", icon: "⏱" },
-      { to: "/policies", label: "Protection policies", icon: "⚙" },
-      { to: "/protection-health", label: "Protection health", icon: "⛨" },
+      { module: "protection", to: "/policies", label: "Protection policies", icon: "⚙" },
+      { module: "protection", to: "/protection-health", label: "Protection health", icon: "⛨" },
       { to: "/agent-health", label: "Agent health", icon: "✚" },
-      { to: "/quarantine", label: "Quarantine", icon: "⊘" },
-      { to: "/vulnerabilities", label: "Vulnerabilities", icon: "⚠" },
-      { to: "/out-of-band", label: "Out-of-band (Intel AMT)", icon: "⏻" },
+      { module: "protection", to: "/quarantine", label: "Quarantine", icon: "⊘" },
+      { module: "vulnerabilities", to: "/vulnerabilities", label: "Vulnerabilities", icon: "⚠" },
+      { module: "network", to: "/out-of-band", label: "Out-of-band (Intel AMT)", icon: "⏻" },
       { to: "/deploy", label: "Deploy agents", icon: "⇩" },
     ],
   },
   {
     group: "Identity, cloud & network",
     items: [
-      { to: "/m365", label: "Microsoft 365", icon: "▦", also: ["/m365-partner"] },
-      { to: "/active-directory", label: "Active Directory", icon: "⌘" },
-      { to: "/exposure", label: "Data & identity exposure", icon: "⚇" },
-      { to: "/backup", label: "Backup & recovery", icon: "⟳" },
-      { to: "/network", label: "Network", icon: "⌁", also: ["/network-topology"] },
-      { to: "/dns", label: "DNS protection", icon: "◈" },
-      { to: "/attack-surface", label: "Attack surface", icon: "◍" },
+      { module: "identity", to: "/m365", label: "Microsoft 365", icon: "▦", also: ["/m365-partner"] },
+      { module: "identity", to: "/active-directory", label: "Active Directory", icon: "⌘" },
+      { module: "identity", to: "/exposure", label: "Data & identity exposure", icon: "⚇" },
+      { module: "backup", to: "/backup", label: "Backup & recovery", icon: "⟳" },
+      { module: "network", to: "/network", label: "Network", icon: "⌁", also: ["/network-topology"] },
+      { module: "security", to: "/dns", label: "DNS protection", icon: "◈" },
+      { module: "network", to: "/attack-surface", label: "Attack surface", icon: "◍" },
     ],
   },
   {
     group: "Service desk",
     items: [
-      { to: "/service-board", label: "Service board", icon: "✉" },
-      { to: "/dispatch", label: "Dispatch", icon: "▦" },
-      { to: "/workload", label: "Workload & changes", icon: "⚖" },
-      { to: "/time", label: "Time & timesheets", icon: "◷" },
+      { module: "service", to: "/service-board", label: "Service board", icon: "✉" },
+      { module: "service", to: "/dispatch", label: "Dispatch", icon: "▦" },
+      { module: "service", to: "/workload", label: "Workload & changes", icon: "⚖" },
+      { module: "service", to: "/time", label: "Time & timesheets", icon: "◷" },
     ],
   },
   {
     group: "Business",
     items: [
-      { to: "/crm", label: "CRM & projects", icon: "☺" },
-      { to: "/onboarding", label: "Customer onboarding", icon: "✓" },
-      { to: "/quotes", label: "Products & quotes", icon: "❖" },
-      { to: "/billing", label: "Agreements & billing", icon: "£" },
+      { module: "business", to: "/crm", label: "CRM & projects", icon: "☺" },
+      { module: "business", to: "/onboarding", label: "Customer onboarding", icon: "✓" },
+      { module: "business", to: "/quotes", label: "Products & quotes", icon: "❖" },
+      { module: "business", to: "/billing", label: "Agreements & billing", icon: "£" },
     ],
   },
-  { group: "Governance", items: [{ to: "/governance", label: "Compliance & GRC", icon: "✓", also: ["/continuous-compliance", "/compliance"] }] },
+  { group: "Governance", items: [{ module: "governance", to: "/governance", label: "Compliance & GRC", icon: "✓", also: ["/continuous-compliance", "/compliance"] }] },
   {
     group: "Admin",
     items: [
       { to: "/settings", label: "Settings", icon: "⚒" },
-      { to: "/service-settings", label: "Service settings", icon: "⚙" },
-      { to: "/rules", label: "Detection rules", icon: "≡" },
-      { to: "/automations", label: "Response rules", icon: "↯" },
-      { to: "/edr-exclusions", label: "EDR exclusions", icon: "⊜" },
-      { to: "/soc-workflows", label: "SOC maintenance", icon: "◷" },
+      { module: "service", to: "/service-settings", label: "Service settings", icon: "⚙" },
+      { module: "security", to: "/rules", label: "Detection rules", icon: "≡" },
+      { module: "security", to: "/automations", label: "Response rules", icon: "↯" },
+      { module: "protection", to: "/edr-exclusions", label: "EDR exclusions", icon: "⊜" },
+      { module: "security", to: "/soc-workflows", label: "SOC maintenance", icon: "◷" },
     ],
   },
 ];
-const PAGES = NAV.flatMap((g) => g.items.map((i) => ({ to: i.to, label: i.label, group: g.group })));
+// Settings > Modules: pages of switched-off modules leave the menu and search (they still open by link).
+function visibleNav(enabled: string[] | null) {
+  return NAV.map((g) => ({ ...g, items: g.items.filter((i) => !i.module || !enabled || enabled.includes(i.module)) }))
+    .filter((g) => g.items.length > 0);
+}
 
 function Login() {
   const { login, completeSso, loginWithPasskey } = useApp();
@@ -223,9 +230,9 @@ function Login() {
     <div className="login">
       <form className="card" onSubmit={submit}>
         <div className="brand" style={{ padding: 0, marginBottom: 20 }}>
-          <div className="brand-mark">F</div>
-          <div><b>Fenrir Console</b><small>Endpoint · SIEM · Exposure · PSA</small></div>
+          <BrandHeader size={40} />
         </div>
+        <DemoNote signIn />
         {microsoft}
         {sso?.required && !showPassword && <p className="small muted" style={{ marginTop: 12 }}>
           <button type="button" className="ghost small" onClick={() => setShowPassword(true)}>Platform administrator? Use a password</button></p>}
@@ -247,6 +254,21 @@ function Login() {
   );
 }
 
+// On a public read-only demo: say so, with the shared login on the sign-in page.
+function DemoNote({ signIn = false }: { signIn?: boolean }) {
+  const { brand } = useBrand();
+  if (!brand.demo) return null;
+  const resets = brand.demo.resets ? ` ${brand.demo.resets}` : "";
+  return (
+    <div role="note" data-testid="demo-note" className="small"
+         style={{ background: "var(--warn-bg, rgba(234,179,8,.15))", border: "1px solid rgba(234,179,8,.45)", borderRadius: 8,
+                  padding: "8px 12px", margin: signIn ? "0 0 14px" : "8px 12px 0" }}>
+      <b>Demo.</b> Everything here is sample data and read-only: changes, agent downloads and remote sessions are turned off.{resets}
+      {signIn && brand.demo.login && <div style={{ marginTop: 4 }}>Sign in with <span className="mono">{brand.demo.login}</span></div>}
+    </div>
+  );
+}
+
 // Phones get a bottom tab bar for the pages a technician opens most; everything else is in the menu.
 const BOTTOM_NAV = [
   { to: "/", label: "Home", icon: "◎" },
@@ -259,6 +281,15 @@ function Shell() {
   const { me, tenantId, setTenantId, logout } = useApp();
   const location = useLocation();
   useEffect(() => { api<{ currency: string }>("region").then((r) => setDefaultCurrency(r.currency)).catch(() => undefined); }, [me?.user.id]);
+  const [enabledModules, setEnabledModules] = useState<string[] | null>(null);
+  useEffect(() => {
+    const load = () => api<{ enabled: string[] }>("modules").then((r) => setEnabledModules(r.enabled)).catch(() => setEnabledModules(null));
+    load();
+    window.addEventListener("fenrir:modules-changed", load);
+    return () => window.removeEventListener("fenrir:modules-changed", load);
+  }, [me?.user.id]);
+  const nav = useMemo(() => visibleNav(enabledModules), [enabledModules]);
+  const pages = useMemo(() => nav.flatMap((g) => g.items.map((i) => ({ to: i.to, label: i.label, group: g.group }))), [nav]);
   const [navOpen, setNavOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const openSearch = useCallback(() => setSearchOpen(true), []);
@@ -276,14 +307,14 @@ function Shell() {
     <div className={`shell ${navOpen ? "nav-open" : ""}`}>
       <div className="nav-backdrop" onClick={() => setNavOpen(false)} aria-hidden />
       <aside className="sidebar" aria-label="Main menu">
-        <div className="brand"><div className="brand-mark">F</div><div><b>Fenrir</b><small>Unified security platform</small></div>
+        <div className="brand"><BrandHeader />
           <button className="ghost nav-close" aria-label="Close menu" onClick={() => setNavOpen(false)}>✕</button></div>
         <div className="nav-account">
           <div className="small">{me.user.email}</div>
           <div className="small muted">{me.user.role.replace(/_/g, " ")}</div>
           <button className="small" onClick={logout}>Sign out</button>
         </div>
-        {NAV.map((group) => (
+        {nav.map((group) => (
           <div key={group.group}>
             <div className="nav-group">{group.group}</div>
             {group.items.map((item) => (
@@ -296,6 +327,7 @@ function Shell() {
         ))}
       </aside>
       <div className="main">
+        <DemoNote />
         <header className="topbar">
           <button className="ghost nav-toggle" aria-label="Open menu" aria-expanded={navOpen} onClick={() => setNavOpen(true)}>☰</button>
           <span className="muted small hide-phone">Viewing</span>
@@ -316,6 +348,7 @@ function Shell() {
             <Route path="/" element={<Overview />} />
             <Route path="/inbox" element={<Inbox />} />
             <Route path="/devices" element={<Devices />} />
+            <Route path="/care" element={<Care />} />
             <Route path="/devices/:id" element={<DeviceDetail />} />
             <Route path="/groups" element={<><PageHead title="Device groups" subtitle="Organise each customer's devices, give groups their own policy, and target them with scripts, patching and monitoring." /><GroupsManager /></>} />
             <Route path="/policies" element={<Policies />} />
@@ -382,7 +415,7 @@ function Shell() {
           </Routes>
           </PageBoundary>
         </main>
-        {searchOpen && <CommandPalette pages={PAGES} onClose={() => setSearchOpen(false)} />}
+        {searchOpen && <CommandPalette pages={pages} onClose={() => setSearchOpen(false)} />}
         <nav className="bottom-nav" aria-label="Quick navigation">
           {BOTTOM_NAV.map((item) => (
             <NavLink key={item.to} to={item.to} end={item.to === "/"} className={({ isActive }) => isActive ? "active" : ""}>
@@ -413,6 +446,8 @@ function RootContent() {
   }
   if (me.user.role === "client" || location.pathname.startsWith("/portal")) return <PageBoundary resetKey={`${location.pathname}${location.search}`}><Portal /></PageBoundary>;
   if (me.mfaSetupRequired) return <MfaSetupGate />;
+  // Family members and carers see only the Care page.
+  if (me.user.role === "carer") return <PageBoundary resetKey={`${location.pathname}${location.search}`}><Care standalone /></PageBoundary>;
   return <Shell />;
 }
 
