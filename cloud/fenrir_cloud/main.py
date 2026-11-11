@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import mimetypes
-import re
 import secrets
+import re
 import sys
 import threading
 import time
@@ -21,12 +21,15 @@ from sqlalchemy import delete, func, select, text
 from . import __version__, crypto, audit, db as database, events, policy_schema, psa, ratelimit, remote, rmm, rmm_library
 from . import vulnmgmt  # noqa: F401 - registers its event handlers
 from . import ai_helpdesk  # noqa: F401 - registers its event handlers
+from . import webpush  # noqa: F401 - registers its event handlers (push delivery)
 from .config import Settings, get_settings, set_settings
 from .detection import sync_builtin_rules
 from .models import Device, DnsQueryLog, Event, RateLimitBucket, Policy, RuleMatch, Tenant, User, utcnow
 from .routers import m365_admin as m365_admin_router
 from .routers import m365 as m365_router, network as network_router, grc as grc_router, backup as backup_router, soc_workflows
 from .routers import documentation as documentation_router
+from .routers import push as push_router
+from .routers import care as care_router
 from .routers import active_directory as ad_router
 from .routers import agent_health as agent_health_router
 from .routers import onboarding as onboarding_router
@@ -52,6 +55,8 @@ from .routers import search as search_router
 from .routers import defender as defender_router
 from .routers import mobile_apps as mobile_apps_router
 from .routers import web_profile as web_profile_router
+from .routers import reports as reports_router, branding as branding_router
+from .routers import deploy as deploy_router
 from .routers import oob as oob_router
 from .routers import hybrid as hybrid_router
 from .routers import customization as customization_router
@@ -77,8 +82,11 @@ def bootstrap(settings: Settings) -> None:
         msp = db.execute(select(Tenant).where(Tenant.kind == "msp")).scalars().first()
         if msp is None:
             name = (settings.msp_name or "My MSP").strip()[:200] or "My MSP"
-            slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:60] or "msp"
-            msp = Tenant(name=name, slug=slug, kind="msp", plan="mdr")
+            slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:80] or "msp"
+            from . import modules
+
+            # A new installation starts with the short Essentials menu (Settings > Modules adds the rest).
+            msp = Tenant(name=name, slug=slug, kind="msp", plan="mdr", settings={"modules": list(modules.MODULES if settings.demo_mode else modules.ESSENTIALS)})
             db.add(msp)
             db.flush()
         if db.get(Policy, GLOBAL_POLICY_ID) is None:
@@ -93,6 +101,12 @@ def bootstrap(settings: Settings) -> None:
                 # Printed once so the first operator can sign in; change it straight away.
                 print(f"\n[fenrir] Created admin {settings.bootstrap_admin_email} with password: {password}\n", file=sys.stderr)
         rmm_library.seed(db)
+        from . import catalogue
+
+        catalogue.seed(db)  # community apps and scripts (catalogue/), new entries only
+        from . import threat_feeds
+
+        threat_feeds.seed(db)  # free threat-intel feeds (abuse.ch, IPsum), synced by the maintenance loop
         from . import condition_remediation
 
         condition_remediation.seed(db)
@@ -100,6 +114,7 @@ def bootstrap(settings: Settings) -> None:
 
         blocklists.ensure_builtin(db)
         psa.ensure_default_boards(db, msp.id)
+        webpush.public_key(db)  # the push-notification key exists before anyone asks for it (reads never write)
         db.commit()
         sync_builtin_rules(db, settings.rules_dir)
         # Once, after the antimalware precision update: close open alerts the tuned rules no longer raise.
@@ -223,19 +238,24 @@ def _purge_telemetry(db, settings: Settings) -> dict:
 
 def _maintenance_jobs(settings: Settings) -> list[tuple[str, object]]:
     """Hourly jobs, in order."""
-    from . import (autodoc, billing_sync, client360, darkweb, defender, grc_automation, m365_partner, m365_reports, m365_standards, m365_workspace,
-                   tprm, web_profile)
+    from . import (autodoc, billing_sync, client360, darkweb, defender, grc_automation, group_rules, m365_partner, m365_reports,
+                   m365_standards, m365_workspace, reports, tprm, web_profile)
 
     jobs: list[tuple[str, object]] = [("telemetry.retention", lambda db: _purge_telemetry(db, settings))]
-    if settings.feed_sync_enabled and settings.feed_url:  # no feed configured: nothing to pull
+    if settings.feed_sync_enabled and settings.feed_url:
         from .intel import sync_feed
 
         jobs.append(("intel.feed", lambda db: log.info("feed sync: %s", sync_feed(db, settings.feed_url, settings.feed_token))))
     jobs += [("m365.partner", m365_partner.tick), ("documentation.auto", autodoc.tick), ("tprm", tprm.tick),
              ("grc.automation", grc_automation.tick), ("darkweb", darkweb.tick), ("m365.standards", m365_standards.tick),
              ("m365.workspace", m365_workspace.tick), ("m365.reports", m365_reports.send_schedules),
+             ("reports.schedules", reports.send_schedules),
              ("billing.sync", billing_sync.tick), ("clients.health", client360.tick),
-             ("defender", defender.tick), ("web.profiles", web_profile.tick)]
+             ("defender", defender.tick), ("web.profiles", web_profile.tick), ("groups.rules", group_rules.tick)]
+    if settings.intel_feeds_enabled:
+        from . import threat_feeds
+
+        jobs.append(("intel.feeds", lambda db: [log.info("intel feed: %s", r) for r in threat_feeds.sync(db, settings.abusech_auth_key)]))
     if settings.dns_blocklists_enabled:
         from . import blocklists
 
@@ -297,6 +317,12 @@ def _poll_msp_mailbox(db) -> None:
         psa.poll_imap(db, msp.id)
 
 
+def _care_tick(db) -> None:
+    from . import care
+
+    care.tick(db)
+
+
 def _scheduled_jobs() -> list[tuple[str, int, object]]:
     """(name, every N passes of 30 seconds, job), in the order they run within a pass."""
     from . import condition_remediation, m365_lifecycle, m365_signin_security, network, remediation, topology
@@ -321,6 +347,7 @@ def _scheduled_jobs() -> list[tuple[str, int, object]]:
         ("artifacts.purge", 120, artifact_store.purge_expired),
         ("audit.checkpoint", 120, audit.daily_checkpoint),  # CORE-06: daily chain-head checkpoint (published to webhooks)
         ("audit.retention", 120, audit.apply_retention),
+        ("care", 2, _care_tick),  # looked-after phones: gone quiet, unacknowledged alerts (every minute)
     ]
 
 
@@ -378,18 +405,23 @@ def _wake_pending(woken: dict[str, float]) -> set[str]:
     from .models import Command
     from .remote import hub
 
-    connected = list(hub.devices)
+    connected = hub.connected_devices()
     if not connected:
+        woken.clear()
         return set()
     with database.session_factory()() as db:
         rows = [row for start in range(0, len(connected), 500) for row in db.execute(
             select(Command.id, Command.device_id).where(Command.status == "pending",
                                                         Command.device_id.in_(connected[start:start + 500]))).all()]
     now = time.monotonic()
-    due = {device_id for command_id, device_id in rows if command_id not in woken}
-    woken.update({command_id: woken.get(command_id, now) for command_id, _ in rows})
-    for command_id in [c for c, at in woken.items() if now - at > 600]:
+    pending = dict(rows)
+    for command_id in woken.keys() - pending.keys():
         del woken[command_id]
+    due = set()
+    for command_id, device_id in pending.items():
+        if command_id not in woken or now - woken[command_id] >= 30:
+            due.add(device_id)
+            woken[command_id] = now
     if due:
         hub.wake(due)
     return due
@@ -443,12 +475,43 @@ def _existing_users() -> int:
         return 0
 
 
+class RequestGate:
+    """Let at most ``limit`` HTTP requests into the app at once; the rest wait in the event loop, holding nothing.
+
+    Without it a burst of agents deadlocked the server: a sync dependency took a database connection on one worker
+    thread, then the request waited for a thread to run its endpoint, while every thread waited for a connection.
+    Requests inside the gate never outnumber threads or connections. WebSockets (the remote relay) are not gated.
+    """
+
+    def __init__(self, app, limit: int) -> None:
+        import asyncio
+
+        self.app, self.limit = app, limit
+        self.slots = asyncio.Semaphore(limit)
+        self.waiting = 0
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path", "").startswith(("/health", "/ready")):
+            await self.app(scope, receive, send)  # health checks must answer even when the server is busy
+            return
+        self.waiting += 1
+        try:
+            await self.slots.acquire()
+        finally:
+            self.waiting -= 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.slots.release()
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     if settings.role not in ("all", "web", "worker"):
         raise RuntimeError(f"FENRIR_ROLE must be all, web or worker, not {settings.role!r}")
     set_settings(settings)
-    database.init_engine(settings.database_url)
+    # Every request inside the gate may hold a connection; background threads and the odd second session need a few more.
+    database.init_engine(settings.database_url, pool_size=settings.http_concurrency + 8, max_overflow=16)
     from . import platform_security
 
     platform_security.invalidate()  # cached for the previous database, if any
@@ -463,6 +526,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        import anyio.to_thread
+
+        # Enough threads for every request inside the gate (sync endpoints and dependencies run on them).
+        anyio.to_thread.current_default_thread_limiter().total_tokens = settings.http_concurrency + 8
         bootstrap(settings)
         if settings.role == "web":
             # The worker queues commands; this process holds the agents' live connections, so it wakes them.
@@ -474,13 +541,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             from .health import watch_loop
 
             threading.Thread(target=watch_loop, args=(settings, stop), daemon=True, name="health-watch").start()
+        from . import stun
+
+        stun_transport = await stun.serve(stun.port()) if stun.port() else None  # direct (peer-to-peer) remote sessions
         yield
+        if stun_transport is not None:
+            stun_transport.close()
         stop.set()
 
     app = FastAPI(title="Fenrir Cloud", version=__version__, lifespan=lifespan,
                   description="Unified control plane: antivirus/EDR fleet, SIEM, DNS protection, exposure management, CRM/PSA.")
     app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_credentials=True,
                        allow_methods=["*"], allow_headers=["*"])
+    app.add_middleware(RequestGate, limit=settings.http_concurrency)
+    if settings.demo_mode:  # outermost: nothing reaches the app that the demo does not allow
+        from .demo_mode import DemoGuard
+
+        app.add_middleware(DemoGuard, seed_token=settings.demo_seed_token)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -504,8 +581,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(onboarding_router.workspace_router)
     for module in (m365_admin_router, m365_router, network_router, grc_router, backup_router, soc_workflows, ad_router, agent_health_router, onboarding_router, m365_exchange_router, m365_signin_router, m365_intune_router, m365_reports_router, m365_collaboration_router, grc_programme_router,
                    rollouts_router, apikeys_router, roles_router, approvals_router, exclusions_router,
-                   exposure_intel_router, m365_partner_router, m365_workspace_router, m365_lifecycle_router, condition_packages_router, triage_router, clients_router, search_router, defender_router, mobile_apps_router):
+                   exposure_intel_router, m365_partner_router, m365_workspace_router, m365_lifecycle_router, condition_packages_router, triage_router, clients_router, search_router, defender_router, mobile_apps_router, push_router, care_router,
+                   reports_router, branding_router, deploy_router):
         app.include_router(module.router)
+    app.include_router(deploy_router.public)
     app.include_router(documentation_router.router)
     app.include_router(m365_router.oauth)
     app.include_router(psa_router.inbound)
@@ -633,6 +712,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return JSONResponse({"detail": "Not found"}, status_code=404)
         return FileResponse(target)
 
+    if settings.enable_legacy:
+        _mount_legacy(app)
 
     console_dir = settings.console_dir
     if console_dir.is_dir() and (console_dir / "index.html").is_file():
@@ -650,6 +731,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return FileResponse(console_dir / "index.html", headers={"Cache-Control": "no-cache"})
 
     return app
+
+
+def _mount_legacy(app: FastAPI) -> None:
+    """Mount the vendored Sentinel investigation API at /legacy/sentinel."""
+    sentinel = Path(__file__).resolve().parents[2] / "components" / "sentinel"
+    if not sentinel.is_dir():
+        log.warning("legacy Sentinel not found at %s", sentinel)
+        return
+    sys.path.insert(0, str(sentinel))
+    try:
+        import importlib
+
+        legacy = importlib.import_module("main")
+        app.mount("/legacy/sentinel", legacy.app)
+        log.info("mounted legacy Sentinel API at /legacy/sentinel")
+    except Exception as exc:  # noqa: BLE001 - legacy code is optional
+        log.warning("could not mount legacy Sentinel: %s", exc)
+    finally:
+        sys.path.remove(str(sentinel))
 
 
 def run() -> None:  # pragma: no cover - CLI entry

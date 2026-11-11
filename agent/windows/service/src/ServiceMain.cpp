@@ -3,6 +3,8 @@
 
 #include <filesystem>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -10,6 +12,7 @@
 #include "CrashReporter.h"
 #include "AgentService.h"
 #include "AgentConfig.h"
+#include "AgentWatchdog.h"
 #include "EnrollmentPersistence.h"
 #include "HardeningManager.h"
 #include "LocalStateStore.h"
@@ -31,6 +34,21 @@ constexpr wchar_t kLocalSystemAccountName[] = L"LocalSystem";
 SERVICE_STATUS_HANDLE g_serviceStatusHandle = nullptr;
 SERVICE_STATUS g_serviceStatus{};
 antivirus::agent::AgentService* g_activeService = nullptr;
+std::mutex g_activeMutex;
+std::mutex g_statusMutex;
+
+void PublishActiveService(antivirus::agent::AgentService* service) {
+  std::lock_guard lock(g_activeMutex);
+  g_activeService = service;
+}
+
+bool SignalActiveService() {
+  std::lock_guard lock(g_activeMutex);
+  if (!g_activeService) return false;
+  g_activeService->RequestStop();
+  return true;
+}
+
 volatile LONG g_stopRequested = 0;
 
 // Failed starts and unexpected termination must be visible in Windows Event Viewer.
@@ -48,13 +66,14 @@ bool WaitForServiceStop(SC_HANDLE service, DWORD timeoutMs);
 
 void UpdateServiceStatus(const DWORD currentState, const DWORD win32ExitCode = NO_ERROR,
                          const DWORD waitHint = 0, const DWORD serviceSpecificExitCode = 0) {
+  std::lock_guard lock(g_statusMutex);
   g_serviceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
   g_serviceStatus.dwCurrentState = currentState;
   g_serviceStatus.dwWin32ExitCode = win32ExitCode;
   g_serviceStatus.dwWaitHint = waitHint;
   g_serviceStatus.dwServiceSpecificExitCode = serviceSpecificExitCode;
   g_serviceStatus.dwControlsAccepted =
-      currentState == SERVICE_START_PENDING ? 0 : (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN);
+      currentState == SERVICE_RUNNING ? (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN) : 0;
   g_serviceStatus.dwCheckPoint =
       (currentState == SERVICE_RUNNING || currentState == SERVICE_STOPPED) ? 0 : g_serviceStatus.dwCheckPoint + 1;
 
@@ -91,15 +110,15 @@ DWORD WINAPI ServiceControlHandler(const DWORD controlCode, DWORD, void*, void*)
         }
       }
       UpdateServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, kStopDeadlineMs);
-      if (g_activeService != nullptr) {
-        g_activeService->RequestStop();
-      }
+      SignalActiveService();
       return NO_ERROR;
-    case SERVICE_CONTROL_INTERROGATE:
+    case SERVICE_CONTROL_INTERROGATE: {
+      std::lock_guard lock(g_statusMutex);
       if (g_serviceStatusHandle != nullptr) {
         SetServiceStatus(g_serviceStatusHandle, &g_serviceStatus);
       }
       return NO_ERROR;
+    }
     default:
       return ERROR_CALL_NOT_IMPLEMENTED;
   }
@@ -115,11 +134,11 @@ void WINAPI ServiceEntry(DWORD, LPWSTR*) {
   g_serviceFinished = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   UpdateServiceStatus(SERVICE_START_PENDING, NO_ERROR, 5'000);
 
-  antivirus::agent::AgentService service;
-  g_activeService = &service;
+  auto service = std::make_unique<antivirus::agent::AgentService>();
+  PublishActiveService(service.get());
 
   UpdateServiceStatus(SERVICE_RUNNING);
-  const auto exitCode = service.Run(antivirus::agent::AgentRunMode::Service);
+  const auto exitCode = service->Run(antivirus::agent::AgentRunMode::Service);
   const bool requestedStop = InterlockedCompareExchange(&g_stopRequested, 0, 0) != 0;
   const bool unexpectedExit = !requestedStop;
   if (exitCode != 0 || unexpectedExit) {
@@ -129,7 +148,8 @@ void WINAPI ServiceEntry(DWORD, LPWSTR*) {
                          L" (agent exit code " + std::to_wstring(exitCode) +
                          L"). Review the installation, signature trust and agent runtime diagnostics.");
   }
-  g_activeService = nullptr;
+  PublishActiveService(nullptr);
+  service.reset();  // finish joining workers while the stop deadline is still active
   // An unexpected clean exit must count as a service failure so Windows can
   // apply the configured restart policy instead of leaving the agent stopped.
   const DWORD failureCode = exitCode != 0 ? static_cast<DWORD>(exitCode) : 1;
@@ -653,11 +673,7 @@ BOOL WINAPI ConsoleControlHandler(const DWORD controlCode) {
     case CTRL_BREAK_EVENT:
     case CTRL_CLOSE_EVENT:
     case CTRL_SHUTDOWN_EVENT:
-      if (g_activeService != nullptr) {
-        g_activeService->RequestStop();
-        return TRUE;
-      }
-      return FALSE;
+      return SignalActiveService() ? TRUE : FALSE;
     default:
       return FALSE;
   }
@@ -665,11 +681,11 @@ BOOL WINAPI ConsoleControlHandler(const DWORD controlCode) {
 
 int RunConsoleMode() {
   antivirus::agent::AgentService service;
-  g_activeService = &service;
+  PublishActiveService(&service);
   SetConsoleCtrlHandler(ConsoleControlHandler, TRUE);
   const auto exitCode = service.Run(antivirus::agent::AgentRunMode::Console);
   SetConsoleCtrlHandler(ConsoleControlHandler, FALSE);
-  g_activeService = nullptr;
+  PublishActiveService(nullptr);
   return exitCode;
 }
 
@@ -725,6 +741,7 @@ bool SaveCloudSettingsFromArguments(int argc, wchar_t* argv[]) {
 void PrintUsage() {
   std::wcout << L"Usage: fenrir-agent-service.exe [--console|--install [--elam-driver <path>]|--repair [--elam-driver <path>]|--upgrade <manifest>|--rollback-update <transaction>|--uninstall [--token <token>]|--wsc-status|--self-test|--register-amsi-provider|--unregister-amsi-provider|--help]" << std::endl;
   std::wcout << L"  --console   Run the agent loop interactively instead of under the SCM." << std::endl;
+  std::wcout << L"  --watchdog  Check the agent once: start it if stopped, restart it if stuck (run by the watchdog task)." << std::endl;
   std::wcout << L"  --server <url> --enroll-token <token>  With --install or --console: connect this PC to your Fenrir cloud." << std::endl;
   std::wcout << L"  --install   Register the agent as an auto-start Windows service and apply hardening." << std::endl;
   std::wcout << L"  --repair    Reapply service hardening, AMSI registration, protected runtime settings, and runtime trust markers." << std::endl;
@@ -788,6 +805,10 @@ int wmain(int argc, wchar_t* argv[]) {
       return UninstallService(token) ? 0 : 1;
     }
 
+    if (command == L"--watchdog") {
+      return antivirus::agent::watchdog::Run();  // run by the scheduled task every 5 minutes
+    }
+
     if (command == L"--wsc-status") {
       return PrintWscStatus();
     }
@@ -823,7 +844,8 @@ int wmain(int argc, wchar_t* argv[]) {
   }
 
   if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
-    return RunConsoleMode();
+    std::wcerr << L"Start FenrirAgent through Windows Services or specify --console for interactive use." << std::endl;
+    return ERROR_FAILED_SERVICE_CONTROLLER_CONNECT;
   }
 
   std::wcerr << L"StartServiceCtrlDispatcherW failed with error " << GetLastError() << std::endl;

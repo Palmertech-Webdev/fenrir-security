@@ -1,14 +1,17 @@
 # Fenrir Platform: cloud API + console + agent downloads in one image.
 # Build from the repository root:  docker build -f deploy/Dockerfile -t fenrir-cloud .
+# FENRIR_AGENTS=none builds the server without any agents or installers (the read-only demo uses it): the agent
+# stages are then skipped entirely and /app/cloud/downloads holds only a note.
+ARG FENRIR_AGENTS=build
 
-FROM node:22.11-bookworm-slim AS console
+FROM node:24.22.1-bookworm-slim AS console
 WORKDIR /src/console
 COPY console/package.json console/package-lock.json* ./
-RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+RUN npm ci --no-audit --no-fund
 COPY console/ ./
 RUN npm run build
 
-FROM golang:1.24-bookworm AS agents
+FROM golang:1.27.3-bookworm AS agents
 WORKDIR /src/agent/linux
 COPY agent/linux/ ./
 # Release signing (FIX-07/AGT-03). The Ed25519 release key arrives as a BuildKit secret (never in a layer); its
@@ -58,9 +61,9 @@ COPY deploy/sign-windows.sh deploy/sign-windows.sh
 # lab: no certificate needed; the agents are built unsigned and labelled "unsigned-lab".
 ARG FENRIR_BUILD_PROFILE=production
 ENV FENRIR_BUILD_PROFILE=${FENRIR_BUILD_PROFILE}
-# Code signing (optional): deploy/signing/codesign.pfx is passed as a BuildKit secret, so the key never lands in
-# a layer. Components are signed first, the installer is rebuilt to embed the signed copies, then it is signed.
-RUN --mount=type=secret,id=codesign_pfx --mount=type=secret,id=codesign_password \
+# Code signing: Azure Trusted Signing settings (deploy/signing/azure-trusted-signing.env) or deploy/signing/codesign.pfx
+# are passed as BuildKit secrets, so no key or credential lands in a layer. Components are signed first, the installer is rebuilt to embed the signed copies, then it is signed.
+RUN --mount=type=secret,id=codesign_pfx --mount=type=secret,id=codesign_password --mount=type=secret,id=codesign_azure \
     SIGN_OUT=/tmp/signing-preflight sh deploy/sign-windows.sh \
  && find agent/windows third_party/sqlite deploy/mingw-x64.cmake -type f -not -path 'agent/windows/out/*' -print0 \
       | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16 > /build-id \
@@ -78,21 +81,35 @@ RUN --mount=type=secret,id=codesign_pfx --mount=type=secret,id=codesign_password
 RUN x86_64-w64-mingw32-objdump -p /out/windows/FenrirSetup.exe > /out/windows/imports.txt && if grep -Ei 'DLL Name:.*(libwinpthread|libgcc|libstdc[+][+])' /out/windows/imports.txt; then echo "ERROR: setup depends on an external compiler runtime"; exit 1; fi
 RUN python3 -c 'import hashlib,json,pathlib; p=pathlib.Path("/out/windows/FenrirSetup.exe"); sig=json.loads(pathlib.Path("/out/windows/signing.json").read_text()); p.with_name("build.json").write_text(json.dumps({"sha256":hashlib.sha256(p.read_bytes()).hexdigest(),"buildId":pathlib.Path("/build-id").read_text().strip(),"platform":"windows-x64","mode":"signed" if sig.get("signed") else "unsigned-lab","profile":"'"$FENRIR_BUILD_PROFILE"'",**sig}))'
 
+# Pick the agents to package: the stages above (build) or an empty placeholder (none). BuildKit skips any stage the
+# final image does not use, so "none" never compiles an agent.
+FROM scratch AS agents-none
+COPY deploy/demo/no-agents/ /out/
+FROM agents AS linux-agents-build
+FROM agents-none AS linux-agents-none
+FROM windows-agents AS windows-agents-build
+FROM agents-none AS windows-agents-none
+FROM linux-agents-${FENRIR_AGENTS} AS linux-agents
+FROM windows-agents-${FENRIR_AGENTS} AS windows-agents-selected
+
 FROM python:3.13-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 FENRIR_CONSOLE_DIR=/app/console/dist
 WORKDIR /app/cloud
 COPY cloud/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt "psycopg[binary]>=3.2"
 COPY cloud/ ./
+COPY catalogue/ /app/catalogue/
 COPY ml/fenrir_ml /app/ml/fenrir_ml
 COPY ml/models /app/ml/models
 COPY --from=console /src/console/dist /app/console/dist
-COPY --from=agents /out/ /app/cloud/downloads/
-COPY --from=windows-agents /out/windows/ /app/cloud/downloads/windows/
+COPY --from=linux-agents /out/ /app/cloud/downloads/
+COPY --from=windows-agents-selected /out/windows/ /app/cloud/downloads/windows/
 # COPY preserves checkout permissions: a pull under umask 077 can leave source
 # root-owned and unreadable to fenrir. Keep packaged code/assets readable and
 # directories traversable, preserve executable agents, and remove group/other
 # write access. Build secrets are mounted separately and never copied here.
+# wixl (msitools) builds each customer's MSI on request (rmm_deploy.py).
+RUN apt-get update && apt-get install -y --no-install-recommends wixl && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 fenrir \
  && chmod -R a+rX,go-w /app \
  && mkdir -p /data && chown fenrir /data

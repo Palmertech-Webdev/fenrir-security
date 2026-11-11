@@ -44,8 +44,4 @@ deploy/signing/*
 agent/windows/service/build-quiet*
 *.zip
 !components/**/*.zip
-
-# Written by deploy/setup.sh for one installation (never commit: secrets and per-server files)
-deploy/.compose-files
-deploy/Caddyfile
-deploy/docker-compose.https.yml
+/site/

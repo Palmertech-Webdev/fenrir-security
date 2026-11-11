@@ -6,6 +6,23 @@ on:
     branches: ["main"]
 
 jobs:
+  demo-image:
+    name: Demo image builds without agents (FENRIR_AGENTS=none)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the server image with no agents and check none are inside
+        shell: bash
+        run: |
+          set -euo pipefail
+          DOCKER_BUILDKIT=1 docker build -f deploy/Dockerfile --build-arg FENRIR_AGENTS=none --build-arg FENRIR_BUILD_PROFILE=lab \
+            -t fenrir-demo-check:ci . 2>&1 | tee /tmp/demo-build.log
+          ! grep -E "mingw|Building CXX|go build" /tmp/demo-build.log
+          files=$(docker run --rm --entrypoint sh fenrir-demo-check:ci -c 'find /app/cloud/downloads -type f | sort')
+          echo "$files"
+          test "$files" = "$(printf '/app/cloud/downloads/README.txt\n/app/cloud/downloads/windows/README.txt')"
+          echo "PASS: the demo image contains no agents or installers"
   cloud-regressions:
     name: Cloud API and Phase 2 regressions (SQLite + PostgreSQL)
     runs-on: ubuntu-latest
@@ -111,7 +128,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "1.27.3"
           cache-dependency-path: agent/linux/go.sum
       - name: Run Go vet, tests, amd64 and arm64 builds
         run: make -C agent/linux test agent agent-arm64
@@ -214,7 +231,7 @@ jobs:
           FENRIR_BUILD_PROFILE=production CODESIGN_PFX=/tmp/empty CODESIGN_PASSWORD_FILE=/tmp/empty SIGN_OUT=/tmp/sig sh deploy/sign-windows.sh 2>/tmp/sign.err
           code=$?
           set -e
-          test "$code" -eq 3 && grep -q "production build profile needs a Windows code-signing certificate" /tmp/sign.err
+          test "$code" -eq 3 && grep -q "production build profile needs Windows code signing" /tmp/sign.err
           FENRIR_BUILD_PROFILE=lab CODESIGN_PFX=/tmp/empty CODESIGN_PASSWORD_FILE=/tmp/empty SIGN_OUT=/tmp/sig sh deploy/sign-windows.sh
           grep -q '"profile": "lab"' /tmp/sig/signing.json
           echo "PASS: production refuses unsigned; lab builds unsigned and says so"
@@ -231,7 +248,10 @@ jobs:
           for name in ('https', 'local'):
               config = json.load(open(f'/tmp/fenrir-{name}.json'))
               ports = config['services']['cloud']['ports']
-              assert len(ports) == 1 and ports[0]['host_ip'] == '127.0.0.1', ports
+              # The API stays on loopback; UDP 3478 (STUN for direct remote sessions) may be public.
+              tcp = [p for p in ports if p.get('protocol', 'tcp') == 'tcp']
+              assert len(tcp) == 1 and tcp[0]['host_ip'] == '127.0.0.1', ports
+              assert all(p.get('protocol') == 'udp' and str(p['target']) == '3478' for p in ports if p not in tcp), ports
           secure = json.load(open('/tmp/fenrir-https.json'))
           assert {str(p['published']) for p in secure['services']['caddy']['ports']} == {'80', '443'}
           print('HTTPS and local evaluation profiles keep the API port on loopback.')
@@ -296,6 +316,9 @@ jobs:
                   assert manifest["sha256"] == hashlib.sha256(data).hexdigest() and manifest["size"] == len(data), (platform, arch)
           print("PASS: unsigned-lab Windows installer and Linux/macOS agents match their build metadata and signed manifests")
           PY
+          # Apple Silicon kills arm64 code with no signature; the linker's ad-hoc one must survive packaging.
+          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.lab.yml --env-file deploy/.env exec -T cloud cat /app/cloud/downloads/fenrir-agent-darwin-arm64 > /tmp/fenrir-agent-darwin-arm64
+          python3 scripts/ci/check_macho_signature.py /tmp/fenrir-agent-darwin-arm64
           # Signatures checked independently of Fenrir's code, with OpenSSL and the run's public key.
           openssl pkey -in "$FENRIR_RELEASE_KEY" -pubout -out /tmp/release-pub.pem
           pub=$(openssl pkey -in "$FENRIR_RELEASE_KEY" -pubout -outform DER | tail -c 32 | base64)
@@ -367,7 +390,7 @@ jobs:
             "PASS  /ready: database up and schema current" \
             "PASS  /health/background" \
             "FAIL  FENRIR_PUBLIC_URL (http://127.0.0.1:8080) is not HTTPS" \
-            "FAIL  No Windows code-signing certificate"; do
+            "FAIL  No Windows code signing"; do
             grep -qF "$expected" /tmp/preflight.txt || { echo "missing: $expected"; exit 1; }
           done
           for name in POSTGRES_PASSWORD FENRIR_SECRET_KEY FENRIR_VAULT_KEY FENRIR_ADMIN_PASSWORD; do

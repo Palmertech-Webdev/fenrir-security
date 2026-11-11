@@ -97,6 +97,7 @@ add_library(antivirus-agent-core STATIC
   src/DestinationProtection.cpp
   src/DestinationVerdictEngine.cpp
   src/DeviceInventoryCollector.cpp
+  src/AgentWatchdog.cpp
   src/EndpointClient.cpp
   src/EvidenceRecorder.cpp
   src/FileDeltaTracker.cpp
@@ -106,6 +107,7 @@ add_library(antivirus-agent-core STATIC
   src/LocalScanRunner.cpp
   src/LocalControlChannel.cpp
   src/LocalSecurity.cpp
+  src/Liveness.cpp
   src/LocalStateStore.cpp
   src/PatchOrchestrator.cpp
   src/PhishingHeuristics.cpp
@@ -638,8 +640,18 @@ add_executable(fenrir-policy-tests ../tests/PolicyAndDeviceControlTests.cpp src/
 target_link_libraries(fenrir-policy-tests PRIVATE bcrypt netapi32 advapi32)
 add_executable(fenrir-admonitor-tests ../tests/AdMonitorTests.cpp src/AdEventRules.cpp)
 target_include_directories(fenrir-admonitor-tests PRIVATE include)
-add_executable(fenrir-rmm-tests ../tests/RmmExecutorTests.cpp src/RmmExecutors.cpp src/CommandCancellation.cpp src/ExtendedPolicy.cpp src/BehaviorRules.cpp src/StringUtils.cpp src/CryptoUtils.cpp)
+add_executable(fenrir-rmm-tests ../tests/RmmExecutorTests.cpp src/RmmExecutors.cpp src/Liveness.cpp src/CommandCancellation.cpp src/ExtendedPolicy.cpp src/BehaviorRules.cpp src/StringUtils.cpp src/CryptoUtils.cpp)
 target_include_directories(fenrir-rmm-tests PRIVATE include ../shared/include)
 target_link_libraries(fenrir-rmm-tests PRIVATE wtsapi32 userenv urlmon advapi32 bcrypt crypt32 wintrust)
 antivirus_apply_portable_runtime(fenrir-rmm-tests)
 target_include_directories(fenrir-policy-tests PRIVATE include)
+
+add_executable(fenrir-json-field-tests ../tests/JsonStringFieldTests.cpp)
+target_include_directories(fenrir-json-field-tests PRIVATE include)
+enable_testing()
+add_test(NAME json-string-fields COMMAND fenrir-json-field-tests)
+
+add_executable(fenrir-agent-connection-tests ../tests/AgentConnectionTests.cpp src/WebSocketClient.cpp)
+target_include_directories(fenrir-agent-connection-tests PRIVATE include)
+target_link_libraries(fenrir-agent-connection-tests PRIVATE winhttp)
+antivirus_apply_portable_runtime(fenrir-agent-connection-tests)

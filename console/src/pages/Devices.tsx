@@ -8,6 +8,11 @@ import { ConnectButtons, pct } from "../components/rmm";
 import { SavedViews } from "../components/Customization";
 import { GroupSelect, groupTree, type Group } from "../components/Groups";
 
+function freshHealth(device: any) {
+  const reported = Date.parse(device.healthReportedAt || "");
+  return device.online && Number.isFinite(reported) && Date.now() - reported < 15 * 60_000;
+}
+
 export default function Devices() {
   const { tenantId, tenantName, can } = useApp();
   const navigate = useNavigate();
@@ -50,7 +55,7 @@ export default function Devices() {
         <input placeholder="Search hostname, OS, IP" value={q} onChange={(e) => setQ(e.target.value)} style={{ minWidth: 260 }} />
         <select value={status} onChange={(e) => setStatus(e.target.value)} aria-label="Status">
           <option value="">Active devices</option><option value="retired">Decommissioned</option><option value="online">Online</option><option value="offline">Offline</option>
-          <option value="isolated">Isolated</option><option value="pending">Awaiting approval</option><option value="at-risk">At risk</option>
+          <option value="isolated">Isolated</option><option value="pending">Awaiting approval</option><option value="at-risk">At risk</option><option value="attention">Needs attention</option>
         </select>
         <select value={platform} onChange={(e) => setPlatform(e.target.value)} aria-label="Platform">
           <option value="">All platforms</option><option value="windows">Windows</option><option value="linux">Linux</option><option value="macos">macOS</option><option value="android">Android</option><option value="ios">iPhone / iPad</option>
@@ -66,6 +71,7 @@ export default function Devices() {
         <SavedViews page="devices" filters={{ q, status, platform, role, group }}
                     onApply={(f) => { setQ(f.q ?? ""); setStatus(f.status ?? ""); setPlatform(f.platform ?? ""); setRole(f.role ?? ""); setGroup(f.group ?? ""); }} />
       </div>
+      {status === "attention" && <p className="small muted">Offline servers, reachable computers with no general command poll for 15 minutes, and devices with failed or unverified patch installs.</p>}
       <ErrorNote error={error} />
       <div className="card">
         <Table rows={data} onRow={(r) => navigate(`/devices/${r.id}`)} empty="No devices match. Deploy the agent to get started."
@@ -80,12 +86,13 @@ export default function Devices() {
                      {r.retired && <Pill value="decommissioned" />}
                      {!r.retired && !r.approved && <Pill value="pending approval" tone="warn" />}
                      {r.isolated && <Pill value="isolated" tone="bad" />}
-                     <Pill value={r.healthState || "unknown"} tone={r.healthState === "healthy" ? "good" : "muted"} />
+                     <Pill value={freshHealth(r) ? r.healthState || "unknown" : `Last reported ${r.healthState || "unknown"}`} tone={freshHealth(r) && r.healthState === "healthy" ? "good" : "muted"} />
                    </div> },
-                 { key: "health", label: "CPU · Mem · Disk free", render: (r) => r.metrics?.reportedAt ? <span className="small mono">{pct(r.metrics.cpuPercent)} · {pct(r.metrics.memoryPercent)} · <span style={{ color: r.metrics.diskFreePercent < 10 ? "#fecaca" : undefined }}>{pct(r.metrics.diskFreePercent)}</span></span> : <span className="muted small">—</span> },
+                 { key: "health", label: "CPU · Mem · Disk free", render: (r) => r.metrics?.reportedAt ? <span className="small mono">{pct(r.metrics.cpuPercent)} · {pct(r.metrics.memoryPercent)} · <span style={{ color: r.metrics.diskFreePercent < 10 ? "#fecaca" : undefined }}>{pct(r.metrics.diskFreePercent)}</span> · {ago(r.metrics.reportedAt)}</span> : <span className="muted small">—</span> },
                  { key: "user", label: "User", render: (r) => <span className="small">{displayValue(r.metrics?.loggedOnUser || "—")}{r.metrics?.rebootPending && <> <Pill value="restart" tone="warn" /></>}</span> },
                  { key: "riskScore", label: "Risk", render: (r) => <div style={{ minWidth: 90 }}><Meter value={r.riskScore} /><span className="small muted">{displayValue(r.riskScore)}</span></div> },
                  { key: "lastSeenAt", label: "Last seen", render: (r) => <span title={presenceOf(r).title}>{presenceOf(r).label === "Online" ? ago(r.lastSeenAt) : `${presenceOf(r).label} · ${ago(r.lastSeenAt)}`}</span> },
+                 { key: "readiness", label: "Command poll · Telemetry", render: (r) => r.agentless ? "—" : <span className="small">{r.commandPollAt ? ago(r.commandPollAt) : "Unreported"} · {r.telemetryAt ? ago(r.telemetryAt) : "Unreported"}</span> },
                  { key: "connect", label: "", render: (r) => r.online && <ConnectButtons device={r} compact /> },
                ]} />
       </div>
@@ -154,23 +161,26 @@ function MoveToGroup({ ids, devices, onClose }: { ids: string[]; devices: any[];
   const { tenantName } = useApp();
   const [tenant, setTenant] = useState(tenants[0] ?? "");
   const [groupId, setGroupId] = useState("");
+  const [automatic, setAutomatic] = useState(false);
   const [result, setResult] = useState<any>(null);
   const { run, busy } = useAction();
   const move = async () => {
-    const reply = await run(() => api<any>("groups/members", { body: { deviceIds: chosen.filter((d) => d.tenantId === tenant).map((d) => d.id), groupId: groupId || null } }),
-                            groupId ? "Moved to the group" : "Taken out of their group");
+    const reply = await run(() => api<any>("groups/members", { body: { deviceIds: chosen.filter((d) => d.tenantId === tenant).map((d) => d.id), groupId: automatic ? "auto" : groupId || null } }),
+                            automatic ? "Handed back to the group rules" : groupId ? "Moved to the group" : "Taken out of their group");
     if (reply) { if (reply.skipped?.length) setResult(reply); else onClose(true); }
   };
   return (
     <Modal title={`Move ${ids.length} device${ids.length === 1 ? "" : "s"} to a group`} onClose={() => onClose(Boolean(result))}
-           footer={!result && <button className="primary" disabled={busy || !tenant} onClick={move}>{groupId ? "Move" : "Take out of group"}</button>}>
+           footer={!result && <button className="primary" disabled={busy || !tenant} onClick={move}>{automatic ? "Use the rules" : groupId ? "Move" : "Take out of group"}</button>}>
       {result ? <p>{result.moved.length} moved. Not moved: {result.skipped.map((s: any) => `${s.deviceId} (${s.reason})`).join(", ")}</p> : <>
         {tenants.length > 1 && <label className="field">Customer
           <select value={tenant} onChange={(e) => { setTenant(e.target.value); setGroupId(""); }}>
             {tenants.map((t) => <option key={t} value={t}>{tenantName(t)} ({chosen.filter((d) => d.tenantId === t).length})</option>)}
           </select>
           <span className="small muted">A group belongs to one customer: only that customer's selected devices move.</span></label>}
-        <label className="field">Group<GroupSelect tenantId={tenant} value={groupId} onChange={setGroupId} emptyLabel="No group (take them out)" /></label>
+        <label className="small" style={{ display: "block", marginBottom: 8 }}><input type="checkbox" checked={automatic} onChange={(e) => setAutomatic(e.target.checked)} /> Automatic: let the group rules decide</label>
+        {!automatic && <label className="field">Group<GroupSelect tenantId={tenant} value={groupId} onChange={setGroupId} emptyLabel="No group (take them out)" /></label>}
+        <p className="small muted">{automatic ? "Each device goes to the group whose rules it matches, or to no group if none match." : "Devices you place by hand stay there: group rules leave them alone."}</p>
       </>}
     </Modal>
   );

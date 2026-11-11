@@ -15,10 +15,11 @@ import secrets
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Path, Query, Request
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import devicekeys
-from .. import rollouts, audit, endpoint_health, intel, psa, rmm, services
+from .. import rollouts, audit, endpoint_health, group_rules, intel, psa, rmm, services
 from ..config import get_settings
 from ..db import get_db
 from ..deps import current_command_device, current_device, current_device_by_key
@@ -91,6 +92,13 @@ def _sync_cmdb_from_agent(db: Session, device: Device) -> None:
                      reason=str(exc))
 
 
+def _reinstall_hash(body: dict, tenant_id: str, platform: str) -> str | None:
+    proof = body.get("reinstallProof")
+    if platform == "windows" and isinstance(proof, str) and re.fullmatch(r"[0-9a-fA-F]{64}", proof):
+        return digest(f"{tenant_id}|windows|{proof.lower()}")
+    return None
+
+
 @router.post("/enroll")
 def enroll(
     request: Request,
@@ -117,6 +125,9 @@ def enroll(
     target_id = reinstatement_target(raw_token) if token else None
     # Only a token issued for reinstating exactly this device counts (an ordinary token cannot pose as one).
     reinstating = target_id is not None and token.label == f"Reinstate {target_id}"
+    platform = _platform(os_version, body.get("platform"))
+    proof = _reinstall_hash(body, tenant.id, platform)
+    resumed = False
     if reinstating:
         device = db.scalar(select(Device).where(Device.id == target_id).with_for_update())
         if device is None or device.tenant_id != tenant.id:
@@ -125,17 +136,45 @@ def enroll(
             raise HTTPException(409, "Device is no longer decommissioned")
         if device.platform != _platform(os_version, body.get("platform")):
             raise HTTPException(409, "Device platform does not match the reinstatement target")
-        if device.serial_number and device.serial_number != serial:
+        # Old Windows releases generated a brace-wrapped v4 GUID per installation.
+        # A device-specific, single-use installer can bridge the first reinstall.
+        legacy_guid = r"(?i)\{[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\}"
+        legacy_windows = (platform == "windows" and proof and not device.reinstall_hash
+                          and device.hostname.casefold() == hostname.casefold()
+                          and re.fullmatch(legacy_guid, device.serial_number or "") and re.fullmatch(legacy_guid, serial))
+        if device.reinstall_hash and device.reinstall_hash != proof:
+            raise HTTPException(409, "Reinstallation identity does not match the reinstatement target")
+        if device.serial_number and device.serial_number != serial and not (proof and device.reinstall_hash == proof or legacy_windows):
             raise HTTPException(409, "Device serial number does not match the reinstatement target")
-    elif token and serial:
+        if proof:
+            owner = db.scalar(select(Device).where(Device.tenant_id == tenant.id, Device.reinstall_hash == proof)
+                              .with_for_update())
+            if owner and owner.id != device.id:
+                if owner.api_key_hash != f"retired-{owner.id}":
+                    raise HTTPException(409, "Decommission the duplicate device before reinstating this record")
+                owner.reinstall_hash = None
+                db.flush()
+                audit.record(db, f"device:{hostname}", "device.duplicate_identity_transferred", device.id,
+                             tenant.id, previousDeviceId=owner.id)
+    elif token and proof:
+        device = db.scalar(select(Device).where(Device.tenant_id == tenant.id, Device.platform == platform,
+                                                Device.reinstall_hash == proof).with_for_update())
+        resumed = device is not None
+    if not reinstating and device is None and token and serial and serial != "SERIAL-UNAVAILABLE":
         # Re-imaged or reinstalled machine: keep its history, rotate its key.
-        device = db.execute(select(Device).where(Device.tenant_id == tenant.id, Device.serial_number == serial)).scalars().first()
+        matches = db.scalars(select(Device).where(Device.tenant_id == tenant.id, Device.platform == platform,
+                                                  Device.serial_number == serial).limit(2).with_for_update()).all()
+        if len(matches) > 1 or (matches and matches[0].reinstall_hash and matches[0].reinstall_hash != proof):
+            raise HTTPException(409, "Device identity conflict")
+        device = matches[0] if matches else None
     if not reinstating and device is not None and device.api_key_hash == f"retired-{device.id}":
         raise HTTPException(409, "Use a reinstatement installer for this decommissioned device")
     if device is None:
         device = Device(tenant_id=tenant.id, hostname=hostname, serial_number=serial, dns_token=secrets.token_urlsafe(24),
                         api_key_hash=digest(api_key))
         db.add(device)
+    if token and proof:
+        device.reinstall_hash = proof
     device.api_key_hash = digest(api_key)
     device.pending_api_key_hash, device.api_key_rotated_at, device.key_rotation_requested = None, utcnow(), False
     if reinstating:
@@ -143,13 +182,21 @@ def enroll(
     device.hostname, device.os_version = hostname, os_version
     device.platform = _platform(os_version, body.get("platform"))
     device.agent_version = str(body.get("agentVersion") or device.agent_version or "")[:64]
-    device.group_id = token.group_id if token and token.group_id else device.group_id
+    if token and token.group_id and not resumed:
+        group_rules.place_by_hand(device, token.group_id)  # the code's group is a person's choice: rules leave it alone
     device.approved = token is not None
     device.ip_address = request.client.host if request.client else ""
     device.last_seen_at = utcnow()
     if token:
         token.uses += 1
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Concurrent enrolment or conflicting device identity")
+    group_rules.evaluate(db, device)  # no-op when the code (or a person earlier) chose the group
+    if resumed:
+        audit.record(db, f"device:{hostname}", "device.reinstalled", device.id, tenant.id)
     _, policy_doc = services.effective_policy(db, device)
     device.applied_policy_revision = policy_doc["revision"]
     _sync_cmdb_from_agent(db, device)
@@ -200,6 +247,16 @@ def heartbeat(body: dict = Body(default={}), device: Device = Depends(current_de
     device.platform_version = str(body.get("platformVersion") or device.platform_version)[:64]
     if re.fullmatch(r"[a-z0-9]{1,64}", str(body.get("buildId") or "")):
         device.agent_build = str(body["buildId"])
+    proof = _reinstall_hash(body, device.tenant_id, device.platform)
+    if device.approved and proof and not device.reinstall_hash:
+        try:
+            with db.begin_nested():
+                device.reinstall_hash = proof
+                db.flush()
+        except IntegrityError:
+            pass  # Another device owns this proof. Keep both records and continue the heartbeat.
+    if body.get("healthState"):
+        device.health_reported_at = utcnow()
     previous_health = device.health_state
     device.health_state = str(body.get("healthState") or device.health_state)[:40]
     endpoint_health.on_heartbeat(db, device, previous_health)
@@ -215,6 +272,10 @@ def heartbeat(body: dict = Body(default={}), device: Device = Depends(current_de
         from .. import android_compliance
 
         android_compliance.record(db, device, body["metrics"], resolution["settings"])
+    if device.platform == "android":
+        from .. import care
+
+        care.on_heartbeat(db, device, body.get("metrics"))
     pending = db.execute(select(func.count()).where(Command.device_id == device.id, Command.status == "pending")).scalar() or 0
     db.commit()
     reply = {"receivedAt": _iso(utcnow()), "effectivePolicyRevision": policy_doc["revision"], "commandsPending": pending,
@@ -224,6 +285,12 @@ def heartbeat(body: dict = Body(default={}), device: Device = Depends(current_de
         # Phones re-sync lost mode from every heartbeat, so a missed command cannot leave it stuck on or off.
         lost = device.lost_mode or {}
         reply["lostMode"] = {"enabled": bool(lost.get("enabled")), "message": lost.get("message", ""), "phone": lost.get("phone", "")}
+        from .. import geofence
+
+        reply["geofences"] = geofence.for_phone(db, device)  # safe zones: proximity alerts and faster location checks
+        from .. import care
+
+        reply["tracking"] = care.tracking_reply(device)  # how often to report location (care level, SOS)
     return reply
 
 
@@ -279,6 +346,42 @@ async def _lenient_json(request: Request) -> dict:
     return body
 
 
+# The agent reporting a problem with itself that needs a person: Microsoft Defender flagging or quarantining it (the
+# device goes offline until the program is restored), or a policy that makes Defender ignore its exclusions.
+AGENT_SELF_ALERTS = {
+    "agent.defender.flagged": ("agent:defender-flagged", "high", "Microsoft Defender flagged the Fenrir agent on {host}",
+                               "Defender treated a Fenrir program as a threat (details below). If it quarantined the agent, the "
+                               "device stays offline until the program is restored: the backup watchdog tries this every 5 "
+                               "minutes. Report the file to Microsoft as a false positive, and make sure Fenrir's folder is "
+                               "excluded in any Defender policy (Group Policy or Intune)."),
+    "agent.defender.exclusions_refused": ("agent:defender-exclusions-refused", "medium",
+                                          "Defender ignores Fenrir's exclusions on {host}",
+                                          "A Group Policy or Intune setting (DisableLocalAdminMerge) makes Microsoft Defender "
+                                          "ignore exclusions set on the PC, so it can quarantine the Fenrir agent. Add Fenrir's "
+                                          "install folder and fenrir-agent-service.exe to the exclusions in that policy."),
+}
+
+
+def _agent_self_alerts(db: Session, device: Device, events: list) -> None:
+    from ..models import Alert
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        rule = AGENT_SELF_ALERTS.get(str(event.get("eventType") or ""))
+        if rule is None:
+            continue
+        rule_id, severity, title, description = rule
+        open_alert = db.execute(select(Alert).where(Alert.device_id == device.id, Alert.rule_id == rule_id,
+                                                    Alert.status.in_(("new", "triaged")))).scalars().first()
+        if open_alert is not None:
+            continue
+        db.add(Alert(tenant_id=device.tenant_id, device_id=device.id, rule_id=rule_id, severity=severity, mitre=[], event_ids=[],
+                     title=title.format(host=device.hostname)[:300],
+                     details={"category": "agent-health", "source": "Fenrir agent", "description": description,
+                              "report": str(event.get("payloadJson") or "")[:4000]}))
+
+
 @router.post("/devices/{device_id}/telemetry")
 def telemetry(body: dict = Depends(_lenient_json), device: Device = Depends(current_device), db: Session = Depends(get_db)):
     events = body.get("events")
@@ -288,6 +391,9 @@ def telemetry(body: dict = Depends(_lenient_json), device: Device = Depends(curr
     if len(events) > limit:
         raise HTTPException(413, f"at most {limit} events per batch")
     result = ingest(db, device, events)
+    if events:
+        device.telemetry_at = utcnow()
+    _agent_self_alerts(db, device, events)
     db.commit()
     # No running total: counting a device's whole history on every batch got slower as the table grew.
     return {"receivedAt": _iso(utcnow()), "accepted": result.accepted, "duplicates": result.duplicates,
@@ -316,7 +422,14 @@ def pending_commands(limit: int = Query(default=20, ge=1, le=100), types: str | 
     commands = db.execute(query.order_by(Command.created_at).limit(limit).with_for_update()
                           .execution_options(populate_existing=True)).scalars().all()
     now = utcnow()
+    if not wanted:
+        device.command_poll_at = now
+    deliver = []
     for command in commands:
+        if command.type == "patch.install" and command.status == "pending" and rmm.patch_window_closed(command, now):
+            rmm.defer_window_install(db, command, now)
+            continue
+        deliver.append(command)
         if command.status == "pending":
             command.status, command.dispatched_at, command.updated_at = "dispatched", now, now
     db.commit()
@@ -325,7 +438,7 @@ def pending_commands(limit: int = Query(default=20, ge=1, le=100), types: str | 
         "items": [
             {"id": c.id, "type": c.type, "issuedBy": c.issued_by, "createdAt": _iso(c.created_at), "updatedAt": _iso(c.updated_at),
              "targetPath": c.target_path, "recordId": c.record_id, "payloadJson": json.dumps({k: v for k, v in c.payload.items() if k != "secretEnvelope"}) if c.payload else ""}
-            for c in commands
+            for c in deliver
         ],
     }
 

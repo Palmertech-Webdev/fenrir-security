@@ -13,6 +13,13 @@ from functools import lru_cache
 from pathlib import Path
 
 
+def _int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
 def _bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -52,6 +59,7 @@ class Settings:
     m365_sync_hours: int = field(default_factory=lambda: int(os.getenv("FENRIR_M365_SYNC_HOURS", "6")))
 
     bootstrap_admin_email: str = field(default_factory=lambda: os.getenv("FENRIR_ADMIN_EMAIL", "admin@fenrir.local"))
+    msp_name: str = field(default_factory=lambda: os.getenv("FENRIR_MSP_NAME", "My MSP"))  # first run only: the MSP tenant's name
     bootstrap_admin_password: str | None = field(default_factory=lambda: os.getenv("FENRIR_ADMIN_PASSWORD"))
 
     # Devices that enroll without a token land in the "Unassigned" tenant and
@@ -61,6 +69,15 @@ class Settings:
     # Upstream signature feed (the signaturedb-fenrir Cloudflare worker).
     feed_url: str = field(default_factory=lambda: os.getenv("FENRIR_FEED_URL", ""))
     feed_token: str = field(default_factory=lambda: os.getenv("FENRIR_FEED_TOKEN", ""))
+    # Free threat-intel feeds the server pulls itself (threat_feeds.py). abuse.ch may ask for a free Auth-Key
+    # (https://auth.abuse.ch); without one its feeds report the error and the others carry on.
+    # Public read-only demo (demo_mode.py): no changes, no agents, no downloads.
+    demo_mode: bool = field(default_factory=lambda: _bool("FENRIR_DEMO_MODE", False))
+    demo_seed_token: str = field(default_factory=lambda: os.getenv("FENRIR_DEMO_SEED_TOKEN", "").strip())
+    demo_login: str = field(default_factory=lambda: os.getenv("FENRIR_DEMO_LOGIN", "").strip())  # shown on the sign-in page
+    demo_reset_note: str = field(default_factory=lambda: os.getenv("FENRIR_DEMO_RESET_NOTE", "").strip())
+    intel_feeds_enabled: bool = field(default_factory=lambda: _bool("FENRIR_INTEL_FEEDS", True))
+    abusech_auth_key: str = field(default_factory=lambda: os.getenv("FENRIR_ABUSECH_AUTH_KEY", "").strip())
     feed_sync_enabled: bool = field(default_factory=lambda: _bool("FENRIR_FEED_SYNC", False))
 
     # Have I Been Pwned subscription key for dark-web credential exposure monitoring (darkweb.py).
@@ -91,8 +108,8 @@ class Settings:
     nvd_api_key: str = field(default_factory=lambda: os.getenv("FENRIR_NVD_API_KEY", ""))
     rules_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent / "rules" / "sigma")
 
-    # Name of the MSP tenant created on first start (your company). Rename it later in Settings.
-    msp_name: str = field(default_factory=lambda: os.getenv("FENRIR_MSP_NAME", "My MSP"))
+    # Mount the vendored Sentinel investigation API under /legacy/sentinel.
+    enable_legacy: bool = field(default_factory=lambda: _bool("FENRIR_ENABLE_LEGACY", False))
     telemetry_retention_days: int = field(default_factory=lambda: int(os.getenv("FENRIR_TELEMETRY_RETENTION_DAYS", "90")))
     max_telemetry_batch: int = field(default_factory=lambda: int(os.getenv("FENRIR_MAX_TELEMETRY_BATCH", "2000")))
     # Routine activity (process, image-load, network, DNS, file, registry, script-scan events at "info") is kept for less time
@@ -103,6 +120,9 @@ class Settings:
         default_factory=lambda: int(os.getenv("FENRIR_ROUTINE_EVENTS_PER_DEVICE_MINUTE", "600")))
     # all: one process serves the API and runs background jobs. web / worker: split them (python -m fenrir_cloud.worker).
     role: str = field(default_factory=lambda: os.getenv("FENRIR_ROLE", "all").strip().lower())
+    # Requests handled at once; the rest wait their turn. Threads and database connections are sized from it so a
+    # burst of agents can never leave every thread waiting for a connection held by a request waiting for a thread.
+    http_concurrency: int = field(default_factory=lambda: max(4, min(256, _int("FENRIR_HTTP_CONCURRENCY", 48))))
     # Device API keys older than this are rotated at the next heartbeat by agents that support it (0 = never).
     device_key_max_age_days: int = field(default_factory=lambda: int(os.getenv("FENRIR_DEVICE_KEY_MAX_AGE_DAYS", "90")))
     # Bearer token for GET /metrics (Prometheus). Unset or shorter than 24 characters: the endpoint answers 404.

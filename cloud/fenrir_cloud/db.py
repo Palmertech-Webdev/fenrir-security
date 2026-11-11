@@ -17,9 +17,9 @@ _session_factory: sessionmaker[Session] | None = None
 
 
 # The newest schema version this build creates. Bump it with every new migration below.
-LATEST_MIGRATION = 57
+LATEST_MIGRATION = 64
 
-def init_engine(url: str) -> Engine:
+def init_engine(url: str, pool_size: int = 5, max_overflow: int = 10) -> Engine:
     global _engine, _session_factory
     kwargs: dict = {"future": True}
     if url.startswith("sqlite"):
@@ -29,7 +29,7 @@ def init_engine(url: str) -> Engine:
 
             kwargs["poolclass"] = StaticPool
     else:
-        kwargs["pool_pre_ping"] = True
+        kwargs.update(pool_pre_ping=True, pool_size=pool_size, max_overflow=max_overflow, pool_timeout=30)
     _engine = create_engine(url, **kwargs)
 
     if url.startswith("sqlite"):
@@ -441,6 +441,39 @@ def migrate(bind: Engine) -> list[int]:
                 ensure_columns(Base, conn)
                 conn.execute(text("INSERT INTO schema_migrations (version) VALUES (57)"))
                 applied.append(57)
+            if 58 not in versions:
+                # Phone safe zones (geofences) and push notifications to the console app
+                from .models import Geofence, PushSubscription
+                Geofence.__table__.create(conn, checkfirst=True)
+                PushSubscription.__table__.create(conn, checkfirst=True)
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (58)"))
+                applied.append(58)
+            if 59 not in versions:
+                ensure_columns(Base, conn)  # devices.care: care settings and SOS state for looked-after phones
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (59)"))
+                applied.append(59)
+            if 60 not in versions:
+                ensure_columns(Base, conn)
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_device_reinstall ON devices (reinstall_hash)"))
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (60)"))
+                applied.append(60)
+            if 61 not in versions:
+                ensure_columns(Base, conn)
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (61)"))
+                applied.append(61)
+            if 62 not in versions:
+                ensure_columns(Base, conn)  # devices.group_rule_id
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (62)"))
+                applied.append(62)
+            if 63 not in versions:
+                ensure_columns(Base, conn)  # client_reports.document: the report as structured data, for PDF copies
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (63)"))
+                applied.append(63)
+            if 64 not in versions:
+                from .models import IntelFeed
+                IntelFeed.__table__.create(conn, checkfirst=True)  # free threat-intel feeds pulled by the server
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (64)"))
+                applied.append(64)
             conn.commit()
         except Exception:
             conn.rollback()

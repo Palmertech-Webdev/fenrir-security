@@ -1,4 +1,6 @@
 #include <windows.h>
+
+#include <cstdio>
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <shlobj.h>
@@ -45,8 +47,7 @@ constexpr wchar_t kMinifilterDefaultInstanceName[] = L"AntivirusMinifilter Insta
 constexpr wchar_t kMinifilterDefaultInstanceAltitude[] = L"370030";
 constexpr wchar_t kAgentRegistryRoot[] = L"SOFTWARE\\FenrirAgent";
 constexpr wchar_t kControlPlaneBaseUrlValueName[] = L"ControlPlaneBaseUrl";
-// No built-in server: installers from a Fenrir console carry its address (--server) and an enrolment token.
-constexpr wchar_t kDefaultControlPlaneBaseUrl[] = L"";
+constexpr wchar_t kDefaultControlPlaneBaseUrl[] = L"";  // each server builds its installer with its own address
 constexpr wchar_t kArpRegistryRoot[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FenrirEndpoint";
 constexpr wchar_t kRunRegistryRoot[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValueName[] = L"FenrirEndpointClient";
@@ -670,8 +671,8 @@ bool BootstrapMinifilterSigningTrust(const std::filesystem::path& driverCatPath,
 
 // Trusts the certificate that signed this installer, so Windows (SmartScreen, UAC, application control)
 // recognises Fenrir's programs as coming from a known publisher. Only a code-signing certificate that
-// cannot issue other certificates is accepted. It always goes into Trusted Publishers. A self-signed
-// certificate also goes into Trusted Root, which lets only that one certificate validate. With remove,
+// cannot issue other certificates is accepted. A certificate that already chains to a publicly trusted root is left
+// alone; otherwise it goes into Trusted Publishers, and a self-signed certificate also goes into Trusted Root, which lets only that one certificate validate. With remove,
 // the same certificate is taken out of both stores (full uninstall).
 std::wstring TrustOwnCodeSigningCertificate(const std::filesystem::path& setupPath, const bool remove) {
   WINTRUST_FILE_INFO fileInfo{};
@@ -747,6 +748,10 @@ std::wstring TrustOwnCodeSigningCertificate(const std::filesystem::path& setupPa
       }
     }
     result = L"Removed the Fenrir code-signing certificate (" + subject + L") from the trusted stores.";
+  } else if (status == ERROR_SUCCESS && !selfSigned) {
+    // Issued by a publicly trusted CA (an EV/OV certificate or Azure Trusted Signing): Windows already trusts it,
+    // and Trusted Signing certificates change every few days, so adding each one would only pile them up.
+    result = L"The installer is signed by " + subject + L", which Windows already trusts; no certificate added.";
   } else {
     std::wstring storeError;
     const bool publisher = EnsureCertificateInMachineStore(certificate, L"TrustedPublisher", &storeError);
@@ -2405,6 +2410,8 @@ bool WriteArpEntry(const std::filesystem::path& installRoot) {
 // While an install, repair or upgrade runs, every log line also goes to <install>\runtime\setup-last.log, so a
 // silent upgrade that went wrong can be diagnosed (and reported by the agent afterwards).
 std::filesystem::path g_setupLogPath;
+// Process exit code in quiet and silent modes: 0 installed, 1 failed (RMM tools and msiexec read it).
+int g_exitCode = 0;
 
 void PostLog(HWND hwnd, const std::wstring& text) {
   if (!g_setupLogPath.empty()) {
@@ -2627,17 +2634,47 @@ void RecoverServiceAfterFailure(HWND hwnd) {
   }
 }
 
-// A scheduled task (as SYSTEM, every 5 minutes) that starts the agent if it has stopped, unless an install or
-// upgrade is in progress (maintenance.flag younger than 30 minutes).
+// The backup watchdog: a scheduled PowerShell task (as SYSTEM, every 5 minutes) that starts the agent if it has
+// stopped, and ends and restarts it if it is running but frozen (its liveness record not updated for 20 minutes),
+// unless an install or upgrade is in progress (maintenance.flag younger than 30 minutes). The agent itself registers
+// the main watchdog ("Fenrir\Agent watchdog": fenrir-agent-service.exe --watchdog) every time it starts; this one is
+// independent of the agent program, in case that program is the problem.
 void RegisterAgentWatchdog(HWND hwnd, const std::filesystem::path& installRoot) {
   const auto script = installRoot / L"tools" / L"fenrir-watchdog.ps1";
   {
     std::wofstream out(script, std::ios::trunc);
-    out << L"# Fenrir agent watchdog: starts the protection service if it has stopped.\r\n"
+    out << L"# Fenrir backup watchdog: starts the agent if it stopped; restarts it if it is frozen.\r\n"
         << L"$flag = '" << MaintenanceFlagPath(installRoot).wstring() << L"'\r\n"
         << L"if ((Test-Path $flag) -and (((Get-Date) - (Get-Item $flag).LastWriteTime).TotalMinutes -lt 30)) { exit 0 }\r\n"
         << L"$service = Get-Service -Name 'FenrirAgent' -ErrorAction SilentlyContinue\r\n"
-        << L"if ($service -and $service.Status -eq 'Stopped') { Start-Service -Name 'FenrirAgent' -ErrorAction SilentlyContinue }\r\n";
+        << L"if (-not $service) { exit 0 }\r\n"
+        << L"$root = (Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\FenrirAgent' -Name RuntimeRoot -ErrorAction SilentlyContinue).RuntimeRoot\r\n"
+        << L"if (-not $root) { $root = '" << (installRoot / L"runtime").wstring() << L"' }\r\n"
+        << L"function Note($text) { Add-Content -Path (Join-Path $root 'watchdog.log') -Value ((Get-Date).ToUniversalTime().ToString('s') + 'Z backup watchdog: ' + $text) }\r\n"
+        // Microsoft Defender can mistake the agent for a Trojan and quarantine it: put it back, keep it excluded.
+        << L"$install = '" << installRoot.wstring() << L"'\r\n"
+        << L"$exe = Join-Path $install '" << kServiceExeName << L"'\r\n"
+        << L"if (-not (Test-Path $exe)) {\r\n"
+        << L"  try { Add-MpPreference -ExclusionPath $install, $root -ExclusionProcess $exe -ErrorAction Stop } catch { }\r\n"
+        << L"  $mp = Join-Path $env:ProgramFiles 'Windows Defender\\MpCmdRun.exe'\r\n"
+        << L"  if (Test-Path $mp) { & $mp -Restore -FilePath $exe | Out-Null }\r\n"
+        << L"  if (Test-Path $exe) {\r\n"
+        << L"    Note 'restored the agent program from Microsoft Defender quarantine'\r\n"
+        << L"    Set-Content -Path (Join-Path $root 'watchdog-action.json') -Value ('{\"at\":' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + ',\"action\":\"restored\",\"reason\":\"Microsoft Defender had quarantined fenrir-agent-service.exe; it was restored and excluded again\"}')\r\n"
+        << L"    Start-Service -Name 'FenrirAgent' -ErrorAction SilentlyContinue\r\n"
+        << L"  } else { Note 'the agent program is missing and could not be restored from quarantine; reinstall the agent' }\r\n"
+        << L"  exit 0\r\n"
+        << L"}\r\n"
+        << L"if ($service.Status -eq 'Stopped') { Start-Service -Name 'FenrirAgent' -ErrorAction SilentlyContinue; exit 0 }\r\n"
+        << L"if ($service.Status -ne 'Running') { exit 0 }\r\n"
+        << L"$live = Join-Path $root 'liveness.json'\r\n"
+        << L"if (-not (Test-Path $live)) { exit 0 }\r\n"
+        << L"if (((Get-Date) - (Get-Item $live).LastWriteTime).TotalMinutes -lt 20) { exit 0 }\r\n"
+        << L"$agentPid = (Get-CimInstance Win32_Service -Filter \"Name='FenrirAgent'\").ProcessId\r\n"
+        << L"if ($agentPid) { Stop-Process -Id $agentPid -Force -ErrorAction SilentlyContinue }\r\n"
+        << L"Start-Sleep -Seconds 10\r\n"
+        << L"Start-Service -Name 'FenrirAgent' -ErrorAction SilentlyContinue\r\n"
+        << L"Note 'restarted a frozen agent'\r\n";
   }
   wchar_t systemDir[MAX_PATH]{};
   GetSystemDirectoryW(systemDir, MAX_PATH);
@@ -2647,11 +2684,11 @@ void RegisterAgentWatchdog(HWND hwnd, const std::filesystem::path& installRoot) 
                               L"-WindowStyle Hidden -File \\\"" + script.wstring() + L"\\\"";
   DWORD exitCode = 0;
   std::wstring error;
-  const bool ok = RunProcessHidden(schtasks, L"/Create /F /TN \"Fenrir\\Agent watchdog\" /SC MINUTE /MO 5 /RU SYSTEM /RL HIGHEST /TR \"" +
+  const bool ok = RunProcessHidden(schtasks, L"/Create /F /TN \"Fenrir\\Agent watchdog (backup)\" /SC MINUTE /MO 5 /RU SYSTEM /RL HIGHEST /TR \"" +
                                        action + L"\"",
                                    installRoot, &exitCode, &error) &&
                   exitCode == 0;
-  PostLog(hwnd, ok ? L"Registered the agent watchdog task (restarts the agent if it stops)."
+  PostLog(hwnd, ok ? L"Registered the backup watchdog task (restarts the agent if it stops or freezes)."
                    : L"Warning: could not register the agent watchdog task. " + error);
 }
 
@@ -2662,6 +2699,8 @@ void RemoveAgentWatchdog(const std::filesystem::path& installRoot) {
   std::wstring error;
   RunProcessHidden(std::filesystem::path(systemDir) / L"schtasks.exe", L"/Delete /F /TN \"Fenrir\\Agent watchdog\"", installRoot,
                    &exitCode, &error);
+  RunProcessHidden(std::filesystem::path(systemDir) / L"schtasks.exe", L"/Delete /F /TN \"Fenrir\\Agent watchdog (backup)\"",
+                   installRoot, &exitCode, &error);
 }
 
 // Microsoft Defender stays active next to Fenrir (only Microsoft-approved products can take over from it), and
@@ -2716,7 +2755,7 @@ void RunInstallOrRepair(HWND hwnd, UiContext* context, const bool repair) {
   std::filesystem::remove(g_setupLogPath, ec);
   // Tells the watchdog not to start the service while files are being replaced.
   std::ofstream(MaintenanceFlagPath(context->installRoot)) << "1";
-  PostLog(hwnd, std::wstring(context->silent ? L"Silent upgrade" : (repair ? L"Repair" : L"Install")) + L" started.");
+  PostLog(hwnd, std::wstring(context->silent ? (repair ? L"Silent upgrade" : L"Quiet install") : (repair ? L"Repair" : L"Install")) + L" started.");
   if (IsProcessElevated()) {
     ConfigureDefenderExclusions(hwnd, context->installRoot, true);  // before any agent file is written
   }
@@ -2795,12 +2834,6 @@ void RunInstallOrRepairSteps(HWND hwnd, UiContext* context, const bool repair) {
     PostLog(hwnd, L"Preserving existing managed cloud endpoint configuration.");
   } else {
     PostLog(hwnd, L"Preparing customer-managed enrollment for the selected cloud server.");
-  }
-  if (context->controlPlaneBaseUrl.empty()) {
-    FailInstall(hwnd, context, false,
-                L"This installer does not know which Fenrir server to use. Download the installer from your Fenrir console "
-                L"(Deploy agents), or run FenrirSetup.exe --server https://your-server --token <enrolment code>.");
-    return;
   }
   if (!PersistControlPlaneUrl(context->controlPlaneBaseUrl, &errorMessage)) {
     FailInstall(hwnd, context, false, errorMessage);
@@ -3369,6 +3402,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
           std::wstring text(static_cast<std::size_t>(length) + 1, L'\0');
           GetWindowTextW(context->logEdit, text.data(), length + 1);
           log << (payload->success ? L"OK: " : L"FAILED: ") << payload->message << L"\r\n\r\n" << text.c_str();
+          g_exitCode = payload->success ? 0 : 1;
           delete payload;
           DestroyWindow(hwnd);
           return 0;
@@ -3413,7 +3447,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         delete context;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
       }
-      PostQuitMessage(0);
+      PostQuitMessage(g_exitCode);
       return 0;
     }
   }
@@ -3477,6 +3511,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     return 1;
   }
 
+  // --quiet (without --uninstall): install or repair with no window and no prompts, for RMM tools, Group Policy, Intune
+  // and the MSI, which run as SYSTEM with nobody to answer a dialog. The result is the exit code and
+  // runtime\last-upgrade.log; nothing is ever shown.
+  const bool quietInstall = argv != nullptr && HasArgument(argc, argv, L"--quiet") && !HasArgument(argc, argv, L"--uninstall");
+  const auto refuse = [&](const wchar_t* text) {
+    if (quietInstall) {
+      std::fwprintf(stderr, L"%ls\n", text);
+    } else {
+      MessageBoxW(hwnd, text, kWindowTitle, MB_OK | MB_ICONERROR);
+    }
+  };
   if (argv != nullptr) {
     auto server = InstallerArgument(argc, argv, L"--server");
     auto token = InstallerArgument(argc, argv, L"--enroll-token");
@@ -3489,7 +3534,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         token = embeddedToken;
       }
     } catch (const std::exception&) {
-      MessageBoxW(hwnd, L"Invalid embedded enrollment configuration. Generate a new installer from Fenrir.", kWindowTitle, MB_OK | MB_ICONERROR);
+      refuse(L"Invalid embedded enrollment configuration. Generate a new installer from Fenrir.");
       DestroyWindow(hwnd);
       LocalFree(argv);
       CoUninitialize();
@@ -3499,7 +3544,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
       if (server.rfind(L"https://", 0) != 0 || token.rfind(L"fet_", 0) != 0 ||
           server.find_first_of(L" \r\n\t\"") != std::wstring::npos ||
           token.find_first_not_of(L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != std::wstring::npos) {
-        MessageBoxW(hwnd, L"Invalid cloud URL or enrollment token provided.", kWindowTitle, MB_OK | MB_ICONERROR);
+        refuse(L"Invalid cloud URL or enrollment token provided.");
         DestroyWindow(hwnd);
         LocalFree(argv);
         CoUninitialize();
@@ -3513,7 +3558,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
   }
 
   const bool silentUpgrade = argv != nullptr && HasArgument(argc, argv, L"--silent-upgrade");
-  if (silentUpgrade) {
+  if (quietInstall && !silentUpgrade) {
+    auto* context = GetContext(hwnd);
+    if (context == nullptr || (!context->installed && (context->controlPlaneBaseUrl.empty() || context->enrollmentToken.empty()))) {
+      refuse(L"A quiet install needs the server and enrolment token: use an installer downloaded from Fenrir, or pass --server and --enroll-token.");
+      DestroyWindow(hwnd);
+      if (argv != nullptr) LocalFree(argv);
+      CoUninitialize();
+      return 3;
+    }
+    context->silent = true;
+    PostMessageW(hwnd, WM_COMMAND, IDC_PRIMARY_BUTTON, 0);
+  } else if (silentUpgrade) {
     auto* context = GetContext(hwnd);
     if (context == nullptr || !context->installed) {
       DestroyWindow(hwnd);  // only upgrades an existing installation, never installs one silently

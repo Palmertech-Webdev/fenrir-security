@@ -9,23 +9,38 @@ Baseline of the review: `main` at `790e364`. Work branch: `claude/jolly-goodall-
 | State | Count |
 |---|---|
 | verified | 6 (FIX-01 to FIX-05, FIX-08) |
-| implemented-unverified | 10 (FIX-07, AGT-04, CORE-03 and 7 requirements the brief marked U) |
-| partial | 101 |
-| missing | 60 |
+| implemented-unverified | 14 (FIX-07, AGT-04, CORE-03, FLOW-01/02/04/09 and 7 requirements the brief marked U) |
+| partial | 119 |
+| missing | 38 |
 | externally-blocked | 1 (FIX-06) |
 
 Overall parity: **not passed**. MVP: **not yet declared**.
+
+## Reports and branding (roadmap 0-30 days)
+
+Branded PDF and HTML reports (executive, monthly, quarterly business review, vulnerability) built from one structured
+document, kept as sent, and emailed on a schedule; MSP branding of the console, sign-in page, reports and Windows agent
+window. VULN-20 moves to `partial`; VULN-21 and M365-31 record the progress. `docs/REPORTS_AND_BRANDING.md`,
+`tests/test_branding_reports.py`.
+
+## 2026-11-08 re-assessment
+
+21 entries recorded as missing were built in later batches and are now `partial` or `implemented-unverified`, each
+citing its code and tests in `catalogue.csv`: VULN-14 (PII discovery), VULN-18 (dark web), GRC-06 (supplier risk),
+FLOW-01/02/04/05/08/09, M365-02 (GDAP), M365-12/13 (Conditional Access and standards), M365-18 to 21 (Exchange),
+M365-22 to 24 (Intune), M365-25/26 (Teams, SharePoint). No entry became `verified`: that still needs the acceptance
+scenario run against real agents or tenants. AGT-02 notes Azure Trusted Signing.
 
 ## Completed
 
 | ID | Commit | Evidence |
 |---|---|---|
-| FIX-01 | `c6de2d9` | Lab/production build profiles. [Smoke run 40590036336](the project repository/actions/runs/40590036336) passed: lab build/start, HTTP smoke, production refuses to build without a certificate, packaged-agent checks. |
+| FIX-01 | `c6de2d9` | Lab/production build profiles. Smoke run 40590036336 passed: lab build/start, HTTP smoke, production refuses to build without a certificate, packaged-agent checks. |
 | FIX-02 | `378c78d` | Coverage-aware OSV verification; `test_scan_integrity.py` (12 cases) |
 | FIX-03 | `2eb277a` | Server-side revocable sessions, remote viewer cut-off; `test_sessions.py` |
 | FIX-04 | `d07687c` | Unresolved exposure counted regardless of workflow state; `test_exposure_counts.py` |
 | FIX-05 | `d87ca95` | Compare-and-swap audit chain head; `test_audit_concurrency.py` (failure reproduced on PostgreSQL 16 before the fix) |
-| FIX-08 | `8fda3b7` | Framework revisions: reworded requirements need review, dry-run diff, snapshots, historical export; `test_grc_revisions.py`. Verified in CI (run 78 (pre-release CI)). |
+| FIX-08 | `8fda3b7` | Framework revisions: reworded requirements need review, dry-run diff, snapshots, historical export; `test_grc_revisions.py`. Verified in CI (run 78). |
 | (owner request) | `473eb80` | Remote desktop Ctrl+Alt+Del is now sent by the agent service. Cross-compiled only; not yet tested on a real server (RMM-09/RMM-10). |
 | FIX-07 / AGT-03 / AGT-04 | (this milestone) | Signed Linux/macOS agent releases; staged rollouts with automatic pause. See `release_test.go` and `test_rollouts.py`. |
 | CORE-01 (API) | (this milestone) | Cross-customer matrix over every API operation. Fixed: customer users could change MSP-wide PSA settings (including the inbound email token); a read-only viewer could edit tickets; non-staff could set staff ticket fields; foreign board/device IDs were accepted on tickets; the portal matched contacts across customers. |
@@ -40,9 +55,9 @@ Overall parity: **not passed**. MVP: **not yet declared**.
 | D-06 (owner decision) | (this batch) | Go live without a Windows driver; Defender provides pre-execution blocking. Protection health shows it per Windows device and warns where there is none. `test_pre_execution.py`. |
 | AGT-05 (proxy, offline) | (this batch) | Installer `--proxy` for Linux/macOS (kept on repair), Windows automatic WinHTTP proxy for every control-plane call, Go agent offline telemetry spool across restarts. |
 | CORE-01 (background jobs) | (this batch) | Every scheduled and hourly job run over two customers' data, including a hostile cross-customer schedule: nothing crosses. `test_background_scope.py` (fails when the target filter is broken). |
-| RMM-09 (owner request) | (this batch) | Backstage hidden SYSTEM desktop on Windows (session 0) with a tools launcher; nothing reaches the user's session. Self-test command and Windows CI acceptance check. |
+| RMM-09 (owner request) | (this batch) | Backstage hidden SYSTEM desktop on Windows (session 0) with a tools launcher; nothing reaches the user's session. Self-test command; Windows CI acceptance check passes on Windows Server 2025 (AT-34, run 41414209548). |
 | CORE-15 (approvals) | (this batch) | Optional two-person approval bound to the exact request and its devices; `test_approvals.py`. |
-| CI | `b5cf672` | Removed the placeholder signing files that the merge brought back. Run 78 (pre-release CI) passed, which also verifies FIX-08 in CI. |
+| CI | `b5cf672` | Removed the placeholder signing files that the merge brought back. Run 78 passed, which also verifies FIX-08 in CI. |
 | Agent health | `bc4455e` | Every agent's build against the server's, why it is not updating (policy, paused rollout, ring), failures reported in 7 days by component until it recovers, failed commands; paused rollouts are shown. |
 | Releases | `51834a6` | Servers follow release tags (stable) or candidates (staging) or a branch; release workflow tests the tag and publishes notes. |
 | False positives (CI) | `37445aa` | Clean-software suite scans 400 installed files on Windows CI; it found a Python wheel quarantined at 99 and four reported scripts; fixed (package archives, compressed bytes, admin-only folders report-only on heuristics). Passes with no quarantine. |

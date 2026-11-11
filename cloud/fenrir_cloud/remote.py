@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -43,7 +44,7 @@ AUDITED = {("backstage", "launch"), ("files", "get"), ("files", "put"), ("files"
            ("sys", "blank"), ("input", "lock"), ("sys", "reboot"), ("tunnel", "open")}
 MODES = {"desktop", "terminal", "files", "backstage", "tunnel"}
 # Channels each mode may use. Backstage never touches the user's desktop; a tunnel carries only its TCP streams.
-MODE_CHANNELS = {"backstage": {"sys", "term", "files", "procs", "svc", "screen", "input", "backstage"}, "tunnel": {"sys", "tunnel"}}
+MODE_CHANNELS = {"backstage": {"sys", "term", "files", "procs", "svc", "screen", "input", "backstage", "rtc"}, "tunnel": {"sys", "tunnel"}}
 # In backstage the screen and input are the hidden SYSTEM desktop in session 0 (never the user's). These act on the
 # user's real session, so they never reach a backstage session: the user must not be able to tell it is happening.
 BACKSTAGE_BLOCKED_INPUT = {"cad", "lock", "blank"}
@@ -93,6 +94,12 @@ def relay_url(session: RemoteSession, role: str = "agent") -> str:
 
 
 # --------------------------------------------------------------------------- session lifecycle
+
+
+def ice_servers() -> list[dict]:
+    from . import stun
+
+    return stun.ice_servers(get_settings().public_base_url)
 
 
 def remote_policy(db: Session, device: Device) -> dict:
@@ -153,6 +160,10 @@ def start_session(db: Session, device: Device, technician: str, mode: str = "des
         "allowTerminal": policy.get("allowTerminal", True), "allowFileTransfer": policy.get("allowFileTransfer", True),
         "showBanner": policy.get("showBanner", True) and not silent, "maxFps": policy.get("maxFps", 15),
         "quality": policy.get("defaultQuality", 70), "idleTimeoutMinutes": policy.get("idleTimeoutMinutes", 30),
+        # Direct (peer-to-peer) screen and input when both ends can reach each other; the relay otherwise.
+        # Recorded sessions stay on the relay, which is where the recording is made.
+        "iceServers": ice_servers(), "direct": bool(policy.get("allowDirect", True)) and not policy.get("recordSessions", False)
+                                                and mode in ("desktop", "backstage"),
     }
     if mode == "tunnel":
         payload.update({"targetHost": session.target_host, "targetPort": session.target_port,
@@ -328,6 +339,7 @@ class Room:
 class RelayHub:
     def __init__(self) -> None:
         self.rooms: dict[str, Room] = {}
+        self._devices_lock = threading.Lock()
         self.devices: dict[str, set[Peer]] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.revoked_sessions: set[str] = set()
@@ -344,24 +356,32 @@ class RelayHub:
     # -- device wake channel ------------------------------------------------
     def register_device(self, device_id: str, peer: Peer) -> None:
         self.loop = asyncio.get_running_loop()
-        self.devices.setdefault(device_id, set()).add(peer)
+        with self._devices_lock:
+            self.devices.setdefault(device_id, set()).add(peer)
 
     def unregister_device(self, device_id: str, peer: Peer) -> None:
-        peers = self.devices.get(device_id)
-        if peers:
-            peers.discard(peer)
-            if not peers:
-                self.devices.pop(device_id, None)
+        with self._devices_lock:
+            peers = self.devices.get(device_id)
+            if peers:
+                peers.discard(peer)
+                if not peers:
+                    self.devices.pop(device_id, None)
 
     def device_online(self, device_id: str) -> bool:
-        return bool(self.devices.get(device_id))
+        with self._devices_lock:
+            return bool(self.devices.get(device_id))
+
+    def connected_devices(self) -> list[str]:
+        with self._devices_lock:
+            return list(self.devices)
 
     def wake(self, device_ids: set[str]) -> None:
         """Tell connected agents to poll for commands now. Safe to call from any thread."""
         loop = self.loop
         if loop is None or loop.is_closed():
             return
-        targets = [peer for device_id in device_ids for peer in self.devices.get(device_id, ())]
+        with self._devices_lock:
+            targets = [peer for device_id in device_ids for peer in self.devices.get(device_id, ())]
         if not targets:
             return
         message = json.dumps({"type": "commands"})
