@@ -107,7 +107,7 @@ certificate builds `production` and one without builds `lab`, logging a warning 
 instead of quietly producing unsigned agents.
 
 Signing the user-mode programs does not sign a kernel driver. The real-time protection minifilter needs
-Microsoft's driver signing (attestation or WHQL) and is not part of this image yet; see docs/parity/decisions.md.
+Microsoft's driver signing (attestation or WHQL) and is not part of this image yet.
 
 ## Timestamps
 
