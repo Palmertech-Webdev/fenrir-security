@@ -1,0 +1,3 @@
+# Who must review changes to which paths. Add your own GitHub users or teams, for example:
+# *                @your-org/maintainers
+# /deploy/         @your-org/maintainers

@@ -97,6 +97,8 @@ add_library(antivirus-agent-core STATIC
   src/DestinationProtection.cpp
   src/DestinationVerdictEngine.cpp
   src/DeviceInventoryCollector.cpp
+  src/DnsProxy.cpp
+  src/DnsProxyCore.cpp
   src/AgentWatchdog.cpp
   src/EndpointClient.cpp
   src/EvidenceRecorder.cpp
@@ -135,6 +137,8 @@ add_library(antivirus-agent-core STATIC
   src/MlStaticModel.cpp
   src/ProcessGuard.cpp
   src/YaraScanner.cpp
+  src/MemoryScanner.cpp
+  src/ZipReader.cpp
   src/EventEnvelope.cpp
   src/RmmExecutors.cpp
   src/WebSocketClient.cpp
@@ -421,6 +425,40 @@ file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../signatures/default-signatures
 file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../signatures/default-cleanware-signers.tsv" SETUP_SIGNATURES_CLEANWARE_SIGNERS_FILE)
 file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../signatures/default-known-good-hashes.tsv" SETUP_SIGNATURES_KNOWN_GOOD_HASHES_FILE)
 file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../signatures/default-observe-only.tsv" SETUP_SIGNATURES_OBSERVE_ONLY_FILE)
+# The minifilter is built with the Windows Driver Kit by .github/workflows/driver.yml, which commits the unsigned
+# package to driver/prebuilt/x64 (this build may run on Linux with MinGW, which cannot compile kernel drivers).
+# It is staged into the development output root once per package version, so the copies signed there in place
+# (deploy/sign-windows.sh) are not overwritten by a later configure.
+set(ANTIVIRUS_EMBED_MINIFILTER ON CACHE BOOL
+  "Stage the prebuilt minifilter package (driver/prebuilt/x64) into the installer.")
+set(ANTIVIRUS_PREBUILT_DRIVER_DIR "${ANTIVIRUS_WINDOWS_ROOT}/driver/prebuilt/x64")
+if(ANTIVIRUS_EMBED_MINIFILTER
+   AND EXISTS "${ANTIVIRUS_PREBUILT_DRIVER_DIR}/AntivirusMinifilter.sys"
+   AND EXISTS "${ANTIVIRUS_PREBUILT_DRIVER_DIR}/AntivirusMinifilter.inf"
+   AND EXISTS "${ANTIVIRUS_PREBUILT_DRIVER_DIR}/AntivirusMinifilter.cat"
+   AND EXISTS "${ANTIVIRUS_PREBUILT_DRIVER_DIR}/build.json")
+  set(ANTIVIRUS_STAGED_DRIVER_DIR "${ANTIVIRUS_DEV_OUTPUT_ROOT}/driver")
+  file(READ "${ANTIVIRUS_PREBUILT_DRIVER_DIR}/build.json" ANTIVIRUS_PREBUILT_DRIVER_BUILD)
+  set(ANTIVIRUS_STAGED_DRIVER_BUILD "")
+  if(EXISTS "${ANTIVIRUS_STAGED_DRIVER_DIR}/build.json")
+    file(READ "${ANTIVIRUS_STAGED_DRIVER_DIR}/build.json" ANTIVIRUS_STAGED_DRIVER_BUILD)
+  endif()
+  if(NOT ANTIVIRUS_PREBUILT_DRIVER_BUILD STREQUAL ANTIVIRUS_STAGED_DRIVER_BUILD
+     OR NOT EXISTS "${ANTIVIRUS_STAGED_DRIVER_DIR}/AntivirusMinifilter.sys")
+    file(MAKE_DIRECTORY "${ANTIVIRUS_STAGED_DRIVER_DIR}")
+    file(COPY
+      "${ANTIVIRUS_PREBUILT_DRIVER_DIR}/AntivirusMinifilter.sys"
+      "${ANTIVIRUS_PREBUILT_DRIVER_DIR}/AntivirusMinifilter.inf"
+      "${ANTIVIRUS_PREBUILT_DRIVER_DIR}/AntivirusMinifilter.cat"
+      "${ANTIVIRUS_PREBUILT_DRIVER_DIR}/build.json"
+      DESTINATION "${ANTIVIRUS_STAGED_DRIVER_DIR}")
+    if(EXISTS "${ANTIVIRUS_WINDOWS_ROOT}/driver/README.md")
+      file(COPY "${ANTIVIRUS_WINDOWS_ROOT}/driver/README.md" DESTINATION "${ANTIVIRUS_STAGED_DRIVER_DIR}")
+    endif()
+    message(STATUS "Staged the prebuilt minifilter package into ${ANTIVIRUS_STAGED_DRIVER_DIR}")
+  endif()
+endif()
+
 file(TO_CMAKE_PATH "${ANTIVIRUS_DEV_OUTPUT_ROOT}/driver/AntivirusMinifilter.inf" SETUP_DRIVER_INF_FILE)
 file(TO_CMAKE_PATH "${ANTIVIRUS_DEV_OUTPUT_ROOT}/driver/AntivirusMinifilter.sys" SETUP_DRIVER_SYS_FILE)
 file(TO_CMAKE_PATH "${ANTIVIRUS_DEV_OUTPUT_ROOT}/driver/AntivirusMinifilter.cat" SETUP_DRIVER_CAT_FILE)
@@ -550,6 +588,30 @@ set_source_files_properties(${SETUP_PAYLOAD_RC} PROPERTIES
   OBJECT_DEPENDS "${SETUP_PAYLOAD_DEPENDENCIES}"
 )
 
+# The setup window's page (installer/native/web/setup.html, plain ASCII), embedded the same way as the agent window's.
+set(SETUP_PAGE "${INSTALLER_NATIVE_DIR}/web/setup.html")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${SETUP_PAGE}")
+file(READ "${SETUP_PAGE}" SETUP_PAGE_CONTENT)
+foreach(placeholder __FENRIR_LOGO_URI__ __FENRIR_INITIAL_STATE__)
+  string(REGEX MATCHALL "${placeholder}" placeholder_hits "${SETUP_PAGE_CONTENT}")
+  list(LENGTH placeholder_hits placeholder_count)
+  if(NOT placeholder_count EQUAL 1)
+    message(FATAL_ERROR "setup.html must contain ${placeholder} exactly once (found ${placeholder_count})")
+  endif()
+endforeach()
+string(LENGTH "${SETUP_PAGE_CONTENT}" SETUP_PAGE_LENGTH)
+set(SETUP_PAGE_CHUNKS "")
+set(SETUP_PAGE_OFFSET 0)
+while(SETUP_PAGE_OFFSET LESS SETUP_PAGE_LENGTH)
+  string(SUBSTRING "${SETUP_PAGE_CONTENT}" ${SETUP_PAGE_OFFSET} 6000 SETUP_PAGE_PART)
+  string(APPEND SETUP_PAGE_CHUNKS "    LR\"FENRIRSETUP(${SETUP_PAGE_PART})FENRIRSETUP\",\n")
+  math(EXPR SETUP_PAGE_OFFSET "${SETUP_PAGE_OFFSET} + 6000")
+endwhile()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/SetupPage.h.tmp"
+  "#pragma once\n// Generated from installer/native/web/setup.html by CMake. Do not edit.\n"
+  "inline const wchar_t* const kSetupPageParts[] = {\n${SETUP_PAGE_CHUNKS}};\n")
+configure_file("${CMAKE_CURRENT_BINARY_DIR}/generated/SetupPage.h.tmp" "${CMAKE_CURRENT_BINARY_DIR}/generated/SetupPage.h" COPYONLY)
+
 add_executable(antivirus-setup WIN32
   ${INSTALLER_NATIVE_DIR}/src/setup.rc
   ${INSTALLER_NATIVE_DIR}/src/SetupMain.cpp
@@ -571,7 +633,10 @@ add_dependencies(antivirus-setup
 
 target_include_directories(antivirus-setup PRIVATE
   ${INSTALLER_NATIVE_DIR}/include
+  include
   ${INSTALLER_NATIVE_DIR}/src
+  ../third_party/webview2/include
+  "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
 target_link_libraries(antivirus-setup PRIVATE comctl32 ole32 shell32 advapi32 crypt32 wintrust dwmapi fwpuclnt netapi32 setupapi)
 # Keep the runtime fully static. A trailing -Bdynamic here overrides -static
@@ -638,6 +703,15 @@ target_include_directories(fenrir-remote-pipe-tests PRIVATE include)
 antivirus_apply_portable_runtime(fenrir-remote-pipe-tests)
 add_executable(fenrir-policy-tests ../tests/PolicyAndDeviceControlTests.cpp src/ExtendedPolicy.cpp src/BehaviorRules.cpp src/DeviceControl.cpp src/FirewallPolicy.cpp src/LocalAdminRotation.cpp src/RansomwareDetector.cpp src/BruteForceTracker.cpp)
 target_link_libraries(fenrir-policy-tests PRIVATE bcrypt netapi32 advapi32)
+# Starting approved programs elevated in the user's session (run as LocalSystem in CI; see the test's header).
+add_executable(fenrir-elevated-launch-tests ../tests/ElevatedLaunchTests.cpp src/TemporaryAdmin.cpp src/LocalAdminRotation.cpp)
+target_include_directories(fenrir-elevated-launch-tests PRIVATE include)
+target_compile_definitions(fenrir-elevated-launch-tests PRIVATE UNICODE _UNICODE)
+target_link_libraries(fenrir-elevated-launch-tests PRIVATE wtsapi32 userenv netapi32 advapi32 bcrypt)
+antivirus_apply_portable_runtime(fenrir-elevated-launch-tests)
+if(MINGW)
+  target_link_options(fenrir-elevated-launch-tests PRIVATE -municode)
+endif()
 add_executable(fenrir-admonitor-tests ../tests/AdMonitorTests.cpp src/AdEventRules.cpp)
 target_include_directories(fenrir-admonitor-tests PRIVATE include)
 add_executable(fenrir-rmm-tests ../tests/RmmExecutorTests.cpp src/RmmExecutors.cpp src/Liveness.cpp src/CommandCancellation.cpp src/ExtendedPolicy.cpp src/BehaviorRules.cpp src/StringUtils.cpp src/CryptoUtils.cpp)
@@ -645,6 +719,14 @@ target_include_directories(fenrir-rmm-tests PRIVATE include ../shared/include)
 target_link_libraries(fenrir-rmm-tests PRIVATE wtsapi32 userenv urlmon advapi32 bcrypt crypt32 wintrust)
 antivirus_apply_portable_runtime(fenrir-rmm-tests)
 target_include_directories(fenrir-policy-tests PRIVATE include)
+
+add_executable(fenrir-dnsproxy-tests ../tests/DnsProxyTests.cpp src/DnsProxyCore.cpp src/ExtendedPolicy.cpp src/BehaviorRules.cpp src/DeviceControl.cpp)
+target_include_directories(fenrir-dnsproxy-tests PRIVATE include)
+antivirus_apply_portable_runtime(fenrir-dnsproxy-tests)
+add_executable(fenrir-dnsproxy-smoke ../tools/dnsproxysmoke/DnsProxySmokeMain.cpp src/DnsProxy.cpp src/DnsProxyCore.cpp src/ExtendedPolicy.cpp src/BehaviorRules.cpp src/DeviceControl.cpp)
+target_include_directories(fenrir-dnsproxy-smoke PRIVATE include)
+target_link_libraries(fenrir-dnsproxy-smoke PRIVATE ws2_32 winhttp iphlpapi advapi32)
+antivirus_apply_portable_runtime(fenrir-dnsproxy-smoke)
 
 add_executable(fenrir-json-field-tests ../tests/JsonStringFieldTests.cpp)
 target_include_directories(fenrir-json-field-tests PRIVATE include)

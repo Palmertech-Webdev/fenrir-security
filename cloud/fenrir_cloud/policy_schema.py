@@ -294,6 +294,11 @@ SCHEMA: tuple[Section, ...] = (
             F("wifiNetworks", "list", [], "Wi-Fi networks",
               "One per line: SSID|WPA2|password or SSID|WPA3|password or SSID|OPEN. Offered to the phone (Android asks the user "
               "once). The password is stored in the policy, so use a network meant for staff devices.", platforms=("android",)),
+            F("privateDns", "enum", "off", "Scam and phishing site blocking (Private DNS)",
+              "fenrir: company-owned phones look up websites through Fenrir's DNS filtering, so scam, phishing and malware "
+              "sites are blocked in every app and browser, using this policy's DNS protection settings. Needs DNS over TLS "
+              "on the server (FENRIR_DOT_HOSTNAME). If Fenrir's DNS cannot be reached the phone switches back to normal DNS "
+              "by itself. Work-profile phones cannot be set this way.", options=("off", "fenrir"), platforms=("android",)),
             F("alwaysOnVpnApp", "str", "", "Always-on VPN app",
               "Package name of a VPN app to keep connected for work apps (work profile).", platforms=("android",)),
             F("alertOnNonCompliance", "bool", True, "Raise an alert when a phone is not compliant",
@@ -362,9 +367,22 @@ SCHEMA: tuple[Section, ...] = (
             F("safeSearch", "bool", False, "Enforce SafeSearch"),
             F("blockThirdPartyDoh", "bool", True, "Block third-party encrypted DNS (DoH/DoT bypass)"),
             F("logQueries", "enum", "blocked", "Query logging", options=("none", "blocked", "all")),
+            F("fenrirRuleset", "enum", "block", "Fenrir DNS ruleset",
+              "The ruleset Fenrir builds from every feed and its threat intel, scored by how many sources agree. block: "
+              "block domains at or above the block threshold (threat categories always, others where the category is "
+              "blocked). monitor: log matches, block nothing. off: not used.", options=("block", "monitor", "off")),
+            F("externalLists", "enum", "direct", "External blocklists",
+              "direct: each enabled list blocks on its own, as well as feeding the ruleset. ruleset: lists only count through "
+              "the Fenrir ruleset's score, so a domain on a single list is no longer blocked by that alone.",
+              options=("direct", "ruleset")),
             F("localProxy", "bool", False, "Local loopback DNS proxy",
-              "The agent answers DNS on a loopback address, forwards it to the device's DoH URL and caches verdicts, so "
-              "blocked domains stay blocked offline. The system resolver is pointed at it and restored when turned off."),
+              "The agent answers DNS on 127.77.0.53, forwards it to the device's DoH URL and caches verdicts, so blocked "
+              "domains stay blocked offline. The system resolver is pointed at it (Windows: a Name Resolution Policy rule; "
+              "Linux and macOS: the resolver settings) and restored when turned off or when the agent stops. Internal names "
+              "(the Active Directory domain, the network's DNS suffixes and the local domains below) still use the network's DNS."),
+            F("localDomains", "list", [], "Local domains (network DNS)",
+              "Internal domains the local proxy always sends to the network's own DNS servers, in addition to the ones Windows "
+              "already knows (the Active Directory domain and DNS suffixes). Example: corp.example.co.uk."),
             F("localProxyFailMode", "enum", "open", "When Fenrir Cloud is unreachable",
               "open: resolve uncached names with the previous system resolver. closed: refuse them.", options=("open", "closed")),
             F("sinkholeInterception", "bool", True, "Intercept connections to blocked domains",
@@ -429,11 +447,22 @@ SCHEMA: tuple[Section, ...] = (
         "Privilege management",
         "Least-privilege controls with just-in-time elevation (PAM).",
         (
-            F("enabled", "bool", False, "Privilege management"),
+            F("enabled", "bool", False, "Privilege management",
+              "Turns on removing standing local admin rights. Admin access requests below work on their own."),
             F("removeLocalAdmins", "bool", False, "Remove standing local admin rights"),
-            F("elevationRequests", "enum", "approval", "Elevation requests", options=("off", "auto-approve", "approval")),
+            F("elevationRequests", "enum", "off", "Admin access requests",
+              "off: users cannot ask (allowances given from a device still work). approval: requests wait for a "
+              "technician unless an auto-approve rule or allowance below matches. auto-approve: every request is "
+              "granted straight away.", options=("off", "auto-approve", "approval")),
             F("elevationMinutes", "int", 30, "Elevation length (minutes)", min=5, max=480),
-            F("autoApprovePublishers", "list", [], "Auto-approve signed by"),
+            F("autoApproveUsers", "list", [], "Auto-approve these users",
+              "One per line: a user name (jo), DOMAIN\\user or PC\\user. Their requests are granted without waiting."),
+            F("autoApprovePrograms", "list", [], "Auto-approve these programs",
+              "One per line: a full path, a path with * wildcards (C:\\Program Files\\Vendor\\*), or a file's SHA-256. "
+              "Avoid folders ordinary users can write to (Downloads, Desktop, Temp)."),
+            F("autoApprovePublishers", "list", [], "Auto-approve programs signed by",
+              "One per line: the publisher exactly as shown on a request (for example Adobe Inc.). Checked on the device "
+              "with a valid signature. Microsoft Windows covers built-in tools, including Command Prompt and PowerShell."),
             F("breakGlassAllowed", "bool", True, "Allow break-glass admin"),
             F("rotateLocalAdminPassword", "bool", False, "Rotate the local admin password (LAPS)",
               "The agent sets a random password for the local Administrator and stores it in the vault first. "
@@ -551,10 +580,10 @@ SCHEMA: tuple[Section, ...] = (
 # wherever it applies, by the agents or by the cloud itself. Keep in step with the agents.
 AGENT_SUPPORT: dict[str, tuple[str, ...]] = {
     "antimalware.cloudLookupObserveOnly": ('windows',),
-    "antimalware.puaProtection": ('linux', 'macos'),
-    "antimalware.scanArchives": ('linux', 'macos'),
+    "antimalware.puaProtection": ('windows', 'linux', 'macos'),
+    "antimalware.scanArchives": ('windows', 'linux', 'macos'),
     "antimalware.archiveObserveOnly": ('windows',),
-    "antimalware.archiveMaxDepth": ('linux', 'macos'),
+    "antimalware.archiveMaxDepth": ('windows', 'linux', 'macos'),
     "antimalware.scanMaliciousBlockThreshold": ('windows',),
     "antimalware.scanMaliciousQuarantineThreshold": ('windows',),
     "antimalware.scanBenignDampeningScore": ('windows',),
@@ -570,10 +599,10 @@ AGENT_SUPPORT: dict[str, tuple[str, ...]] = {
     "antimalware.requireSignerForSuppression": ('windows',),
     "antimalware.allowUnsignedSuppressionPathExecutables": ('windows',),
     "edr.quarantineAfterProcessKill": ('windows',),
-    "edr.memoryScanning": (),
-    "edr.exploitProtection": (),
+    "edr.memoryScanning": ('windows',),
+    "edr.exploitProtection": ('windows',),
     "edr.credentialProtection": ('windows',),
-    "edr.deceptionLures": (),
+    "edr.deceptionLures": ('windows',),
     "edr.collectNetworkEvents": ('linux', 'macos'),
     "edr.collectRegistryEvents": ('windows',),
     "edr.telemetryUploadSeconds": ('linux', 'macos'),
@@ -616,10 +645,11 @@ AGENT_SUPPORT: dict[str, tuple[str, ...]] = {
     "web.phishingBlockThreshold": ('windows',),
     "web.destinationCacheTtlMinutes": ('windows',),
     "web.bankingProtection": (),
-    "dns.localProxy": ('linux', 'macos'),
-    "dns.localProxyFailMode": ('linux', 'macos'),
+    "dns.localProxy": ('windows', 'linux'),  # never on macOS: the agent ignores it (loopback DNS cut Macs off)
+    "dns.localProxyFailMode": ('windows', 'linux'),  # never on macOS: the agent ignores it (loopback DNS cut Macs off)
     "dns.sinkholeInterception": ('linux', 'macos'),
-    "dns.localCacheMinutes": ('linux', 'macos'),
+    "dns.localCacheMinutes": ('windows', 'linux', 'macos'),
+    "dns.localDomains": ('windows',),
     "firewall.networkAttackProtection": (),
     "firewall.bruteForceProtection": ('windows', 'linux', 'macos'),
     "firewall.blockSmbV1": ('windows',),
@@ -630,7 +660,9 @@ AGENT_SUPPORT: dict[str, tuple[str, ...]] = {
     "privilege.removeLocalAdmins": ('windows',),
     "privilege.elevationRequests": ('windows',),
     "privilege.elevationMinutes": ('windows',),
-    "privilege.autoApprovePublishers": (),
+    "privilege.autoApprovePublishers": ('windows',),
+    "privilege.autoApproveUsers": ('windows',),
+    "privilege.autoApprovePrograms": ('windows',),
     "tamper.enabled": ('windows',),
     "tamper.uninstallRequiresToken": ('windows',),
     "tamper.protectServiceAndFiles": ('windows',),
@@ -727,6 +759,123 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "dns": {"mode": "observe"},
         "response": {"autoKillOnHigh": False, "autoQuarantine": False, "autoRollbackRansomware": False},
     },
+    # ------------------------------------------------------------------------------------------------------------
+    # By operating system and role. Each lists only what differs from the defaults (Balanced). Settings an OS's agent
+    # does not enforce are left out of that OS's templates, so nothing in them is for show.
+    # DNS: Windows and Linux workstations use the local DNS proxy and fail open, so a hotel or captive-portal network is
+    # never left without DNS. Macs never use it (the agent ignores dns.localProxy on macOS: loopback DNS cut Macs off).
+    # Servers do not: they often resolve internal names, run DNS or Active Directory, or sit behind their own
+    # resolvers, and a server losing name resolution is an outage.
+    # Servers never remove local admins automatically and are never auto-isolated: both are a decision for a person.
+    "windows-workstation": {
+        "_label": "Windows - Workstations",
+        "_description": "Desktops and laptops: full protection, local DNS proxy, ransomware rollback, deception lures, USB audited, "
+                        "local admin password rotation.",
+        "antimalware": {"scanCpuLimitPercent": 30, "scanRemovableMedia": True, "puaProtection": "block", "scanArchives": True},
+        "edr": {"memoryScanning": True, "exploitProtection": True, "credentialProtection": True, "deceptionLures": True},
+        "attackSurface": {"blockWebshellCreation": "off", "blockPsexecWmiProcessCreation": "audit"},
+        "ransomware": {"mode": "block-and-rollback", "protectedFoldersMode": "audit", "canaryFiles": True},
+        "web": {"blockKnownScamDestinations": True},
+        "dns": {"localProxy": True, "localProxyFailMode": "open"},
+        "deviceControl": {"usbStorage": "audit"},
+        "privilege": {"enabled": True, "removeLocalAdmins": False, "elevationRequests": "approval", "rotateLocalAdminPassword": True},
+        "patch": {"autoApprove": "security", "rebootBehaviour": "prompt"},
+        "response": {"autoIsolateOnCritical": True, "autoKillOnHigh": True, "autoOpenTicket": "high"},
+        "experience": {"trayIcon": True, "notifications": "important", "allowUserScans": True},
+        "remoteAccess": {"consent": "when_user_present"},
+    },
+    "windows-server": {
+        "_label": "Windows - Servers",
+        "_description": "File, application and domain servers: scans at night and capped at 25% CPU, webshell blocking, share "
+                        "protection, no DNS proxy, no automatic isolation or admin removal, no user prompts.",
+        "antimalware": {"scanCpuLimitPercent": 25, "quickScanSchedule": "daily 03:00", "fullScanSchedule": "weekly sun 03:00",
+                        "scanRemovableMedia": False},
+        "edr": {"memoryScanning": True, "exploitProtection": True, "credentialProtection": True, "deceptionLures": True},
+        "attackSurface": {"blockWebshellCreation": "block", "blockPsexecWmiProcessCreation": "audit"},
+        "ransomware": {"mode": "block-and-rollback", "networkShareProtection": True, "snapshotIntervalHours": 2,
+                       "protectedFoldersMode": "off"},
+        "dns": {"localProxy": False},
+        "deviceControl": {"usbStorage": "block"},
+        "privilege": {"enabled": False, "removeLocalAdmins": False, "rotateLocalAdminPassword": True},
+        "patch": {"autoApprove": "critical", "rebootBehaviour": "never", "installInWindow": True,
+                  "maintenanceWindow": "daily 01:00-05:00"},
+        "response": {"autoIsolateOnCritical": False, "autoKillOnHigh": True, "autoOpenTicket": "medium"},
+        "experience": {"trayIcon": False, "notifications": "none", "allowUserScans": False},
+        "remoteAccess": {"consent": "never", "showBanner": True},
+    },
+    "linux-workstation": {
+        "_label": "Linux - Workstations",
+        "_description": "Desktops and laptops: full protection, local DNS proxy (fails open), USB audited, the device's own "
+                        "firewall rules left alone.",
+        "antimalware": {"scanCpuLimitPercent": 30, "puaProtection": "block", "scanArchives": True},
+        "dns": {"localProxy": True, "localProxyFailMode": "open"},
+        "firewall": {"defaultsOnLinuxMac": False, "bruteForceProtection": True},
+        "deviceControl": {"usbStorage": "audit"},
+        "patch": {"autoApprove": "security", "rebootBehaviour": "prompt"},
+        "response": {"autoIsolateOnCritical": True, "autoOpenTicket": "high"},
+    },
+    "linux-server": {
+        "_label": "Linux - Servers",
+        "_description": "Web, database and application servers: night scans capped at 25% CPU, webshell blocking, SSH brute-force "
+                        "protection, no DNS proxy, the server's own firewall left alone, no automatic isolation.",
+        "antimalware": {"scanCpuLimitPercent": 25, "quickScanSchedule": "daily 03:00", "fullScanSchedule": "weekly sun 03:00",
+                        "scanRemovableMedia": False},
+        "attackSurface": {"blockWebshellCreation": "block"},
+        "dns": {"localProxy": False},
+        "firewall": {"defaultsOnLinuxMac": False, "bruteForceProtection": True},
+        "deviceControl": {"usbStorage": "block"},
+        "privilege": {"enabled": False},
+        "patch": {"autoApprove": "security", "rebootBehaviour": "never", "installInWindow": True,
+                  "maintenanceWindow": "daily 01:00-05:00"},
+        "response": {"autoIsolateOnCritical": False, "autoOpenTicket": "medium", "remoteShell": False},
+        "remoteAccess": {"consent": "never"},
+    },
+    "macos-workstation": {
+        "_label": "macOS - Workstations",
+        "_description": "MacBooks and iMacs: full protection, USB audited, the Mac's own DNS and firewall settings left alone "
+                        "(Macs never use the loopback DNS proxy).",
+        "antimalware": {"scanCpuLimitPercent": 30, "puaProtection": "block", "scanArchives": True},
+        "firewall": {"defaultsOnLinuxMac": False},
+        "deviceControl": {"usbStorage": "audit"},
+        "patch": {"autoApprove": "security", "rebootBehaviour": "prompt"},
+        "response": {"autoIsolateOnCritical": True, "autoOpenTicket": "high"},
+        "remoteAccess": {"consent": "when_user_present"},
+    },
+    "macos-server": {
+        "_label": "macOS - Servers",
+        "_description": "Mac minis and build or file servers: night scans capped at 25% CPU, the Mac's own DNS left alone, "
+                        "no automatic isolation, no user prompts.",
+        "antimalware": {"scanCpuLimitPercent": 25, "quickScanSchedule": "daily 03:00", "fullScanSchedule": "weekly sun 03:00",
+                        "scanRemovableMedia": False},
+        "firewall": {"defaultsOnLinuxMac": False, "bruteForceProtection": True},
+        "deviceControl": {"usbStorage": "block"},
+        "privilege": {"enabled": False},
+        "patch": {"autoApprove": "security", "rebootBehaviour": "never", "installInWindow": True,
+                  "maintenanceWindow": "daily 01:00-05:00"},
+        "response": {"autoIsolateOnCritical": False, "autoOpenTicket": "medium"},
+        "remoteAccess": {"consent": "never"},
+    },
+    "android": {
+        "_label": "Android - Phones and tablets",
+        "_description": "Sensible protection without locking phones down: harmful and scam apps flagged (malicious ones "
+                        "suspended on company-owned phones), installs from outside Play blocked, a screen lock and "
+                        "encryption required, rooted or out-of-date phones flagged, scam and phishing sites blocked "
+                        "on company-owned phones. No camera, Bluetooth or account "
+                        "restrictions and no remote wipe after failed attempts.",
+        # App protection: alert from suspicious upwards; suspend malicious apps (company-owned / device-owner phones).
+        "mobile": {"alertOn": "medium", "suspendMalicious": True},
+        "android": {
+            # Scam apps (fake banking, parcel and "security" apps) mostly arrive as sideloaded APKs.
+            "blockUnknownSources": True,
+            "passcodeComplexity": "low", "screenLockMinutes": 5, "requireEncryption": True,
+            "flagRooted": True, "minSecurityPatchDays": 90, "blockDeveloperOptions": True,
+            "wipeAfterFailedAttempts": 0, "disableCamera": False, "disableScreenCapture": False,
+            "blockAddingAccounts": False, "blockBluetoothSharing": False, "runtimePermissions": "prompt",
+            "alertOnNonCompliance": True,
+            # Scam and phishing sites blocked on company-owned phones through Fenrir's DNS (falls back by itself).
+            "privateDns": "fenrir",
+        },
+    },
 }
 
 
@@ -768,6 +917,16 @@ def _coerce(path: str, spec: F, value: Any) -> Any:
             bad = [item for item in cleaned if item not in spec.options]
             if bad:
                 raise PolicyError(f"{path} has unknown values: {', '.join(bad)}")
+        if path == "dns.localDomains":
+            import re as _re
+
+            pattern = _re.compile(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.?$")
+            cleaned = [item.lower() for item in cleaned]
+            bad = [item for item in cleaned if len(item) > 253 or not pattern.match(item)]
+            if bad:
+                raise PolicyError(f"dns.localDomains: not a domain name: {', '.join(bad[:5])}")
+            if len(cleaned) > 100:
+                raise PolicyError("dns.localDomains: at most 100 domains")
         if path == "firewall.rules":
             for item in cleaned:
                 if not item.startswith("#") and parse_firewall_rule(item) is None:
@@ -823,6 +982,19 @@ class Layer:
     name: str
     settings: dict
     locks: list[str] = field(default_factory=list)
+
+
+def elevation_mode(resolution: dict) -> str:
+    """Admin access requests (privilege.elevationRequests), independent of the Privilege management switch.
+
+    Before they were separate, requests only worked with privilege.enabled on and the default was "approval". A policy
+    that never chose a value keeps that behaviour: "approval" with the switch on, "off" without it.
+    """
+    privilege = resolution["settings"].get("privilege", {})
+    mode = str(privilege.get("elevationRequests") or "off")
+    if resolution.get("origin", {}).get("privilege.elevationRequests", "default") == "default":
+        return "approval" if privilege.get("enabled") else "off"
+    return mode if mode in ("off", "auto-approve", "approval") else "off"
 
 
 def resolve(layers: list[Layer]) -> dict:

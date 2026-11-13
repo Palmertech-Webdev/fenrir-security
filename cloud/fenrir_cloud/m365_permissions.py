@@ -30,6 +30,7 @@ SUPERSETS: dict[str, tuple[str, ...]] = {
     "Organization.Read.All": ("Directory.Read.All", "Directory.ReadWrite.All", "Organization.ReadWrite.All"),
     "RoleManagement.Read.Directory": ("RoleManagement.ReadWrite.Directory", "Directory.Read.All", "Directory.ReadWrite.All"),
     "Policy.Read.All": ("Policy.ReadWrite.ConditionalAccess",),
+    "Mail.Read": ("Mail.ReadWrite",),
 }
 
 # key: title, area, app permissions, delegated permissions, note
@@ -114,6 +115,14 @@ FEATURES: dict[str, dict] = {
     "collaboration": {"title": "Teams, SharePoint and OneDrive", "area": "Collaboration",
                       "app": ["Sites.Read.All", "SharePointTenantSettings.ReadWrite.All", "Team.ReadBasic.All", "Files.ReadWrite.All"],
                       "delegated": ["Sites.Read.All", "SharePointTenantSettings.ReadWrite.All", "Team.ReadBasic.All", "Files.ReadWrite.All"]},
+    "email.security": {"title": "Email security: scan mail (shadow mode)", "area": "Security", "app": ["Mail.Read", "User.Read.All"],
+                       "delegated": None,
+                       "note": "Reads every mailbox's new mail to score it; nothing is changed. Microsoft only allows this with "
+                               "an app connection, not GDAP. To limit which mailboxes, add an Exchange application access policy."},
+    "email.protect": {"title": "Email security: quarantine and tag mail (protect mode)", "area": "Security",
+                      "app": ["Mail.ReadWrite", "User.Read.All"], "delegated": None,
+                      "note": "Moves phishing and malware to a hidden quarantine folder, or to Junk, and tags suspicious "
+                              "mail. Only with an app connection, not GDAP."},
     "reports.usage": {"title": "Usage and activity reports", "area": "Reports", "app": ["Reports.Read.All", "UserAuthenticationMethod.Read.All"],
                       "delegated": ["Reports.Read.All", "UserAuthenticationMethod.Read.All"]},
 }

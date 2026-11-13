@@ -16,11 +16,11 @@ val signing = Properties().apply {
 }
 
 android {
-    namespace = "uk.co.fenrirsecurity.agent"
+    namespace = "com.example.fenrir.agent"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "uk.co.fenrirsecurity.agent"
+        applicationId = "com.example.fenrir.agent"
         minSdk = 26
         targetSdk = 35
         versionCode = (System.getenv("FENRIR_ANDROID_VERSION_CODE") ?: "1").toInt()

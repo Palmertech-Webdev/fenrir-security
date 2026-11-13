@@ -87,7 +87,7 @@ run.
   devices (at least one, at most five) take it first, and the rest wait until those have come back on the new build and
   kept checking in for 30 minutes. A device that goes silent after taking a build pauses the rollout within about 20
   minutes; **Agent health** says which devices are waiting and why.
-- [ ] If they use Microsoft 365, connect their tenant ([Microsoft 365 administration](M365_ADMINISTRATION.md)).
+- [ ] If they use Microsoft 365, connect their tenant (Microsoft 365 administration).
 
 ## Running it
 

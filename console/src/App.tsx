@@ -8,7 +8,6 @@ import OutOfBand from "./pages/OutOfBand";
 import RemediationPackages from "./pages/rmm/RemediationPackages";
 import Governance from "./pages/Governance";
 import Assurance from "./pages/grc/Assurance";
-import Backup from "./pages/Backup";
 import SocWorkflows from "./pages/SocWorkflows";
 import { FormEvent, lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
@@ -39,7 +38,6 @@ import CrmAccount from "./pages/CrmAccount";
 import Onboarding from "./pages/Onboarding";
 import Billing from "./pages/Billing";
 import Portal from "./pages/Portal";
-import Care from "./pages/Care";
 
 const RemoteViewer = lazy(() => import("./pages/RemoteViewer"));
 import Scripts from "./pages/rmm/Scripts";
@@ -67,6 +65,7 @@ import { PolicyEditor as GrcPolicyEditor } from "./pages/grc/Policies";
 import ProtectionHealth from "./pages/ProtectionHealth";
 import AgentHealth from "./pages/AgentHealth";
 import Quarantine from "./pages/Quarantine";
+import EmailSecurity from "./pages/EmailSecurity";
 import EdrExclusions from "./pages/EdrExclusions";
 import Exposure from "./pages/Exposure";
 import Elevation from "./pages/Elevation";
@@ -105,7 +104,6 @@ const NAV: { group: string; items: { to: string; label: string; icon: string; al
     group: "Endpoints",
     items: [
       { to: "/devices", label: "Devices", icon: "▣" },
-      { module: "care", to: "/care", label: "Care", icon: "♡" },
       { to: "/groups", label: "Device groups", icon: "⧉" },
       { to: "/monitoring", label: "Monitoring", icon: "♥" },
       { to: "/patching", label: "Patching", icon: "⟳" },
@@ -126,9 +124,9 @@ const NAV: { group: string; items: { to: string; label: string; icon: string; al
     group: "Identity, cloud & network",
     items: [
       { module: "identity", to: "/m365", label: "Microsoft 365", icon: "▦", also: ["/m365-partner"] },
+      { module: "email", to: "/email-security", label: "Email security", icon: "✉" },
       { module: "identity", to: "/active-directory", label: "Active Directory", icon: "⌘" },
       { module: "identity", to: "/exposure", label: "Data & identity exposure", icon: "⚇" },
-      { module: "backup", to: "/backup", label: "Backup & recovery", icon: "⟳" },
       { module: "network", to: "/network", label: "Network", icon: "⌁", also: ["/network-topology"] },
       { module: "security", to: "/dns", label: "DNS protection", icon: "◈" },
       { module: "network", to: "/attack-surface", label: "Attack surface", icon: "◍" },
@@ -348,7 +346,6 @@ function Shell() {
             <Route path="/" element={<Overview />} />
             <Route path="/inbox" element={<Inbox />} />
             <Route path="/devices" element={<Devices />} />
-            <Route path="/care" element={<Care />} />
             <Route path="/devices/:id" element={<DeviceDetail />} />
             <Route path="/groups" element={<><PageHead title="Device groups" subtitle="Organise each customer's devices, give groups their own policy, and target them with scripts, patching and monitoring." /><GroupsManager /></>} />
             <Route path="/policies" element={<Policies />} />
@@ -358,6 +355,7 @@ function Shell() {
             <Route path="/protection-health" element={<ProtectionHealth />} />
             <Route path="/agent-health" element={<AgentHealth />} />
             <Route path="/quarantine" element={<Quarantine />} />
+            <Route path="/email-security" element={<EmailSecurity />} />
             <Route path="/edr-exclusions" element={<EdrExclusions />} />
             <Route path="/admin-requests" element={<Elevation />} />
             <Route path="/recordings/:id" element={<RecordingPlayer />} />
@@ -409,7 +407,6 @@ function Shell() {
             <Route path="/continuous-compliance" element={<Assurance />} />
             <Route path="/governance/policies/:id" element={<GrcPolicyEditor />} />
             <Route path="/governance/:tenantId/:framework" element={<ProgrammeDetail />} />
-            <Route path="/backup" element={<Backup />} />
             <Route path="/soc-workflows" element={<SocWorkflows />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
@@ -446,8 +443,6 @@ function RootContent() {
   }
   if (me.user.role === "client" || location.pathname.startsWith("/portal")) return <PageBoundary resetKey={`${location.pathname}${location.search}`}><Portal /></PageBoundary>;
   if (me.mfaSetupRequired) return <MfaSetupGate />;
-  // Family members and carers see only the Care page.
-  if (me.user.role === "carer") return <PageBoundary resetKey={`${location.pathname}${location.search}`}><Care standalone /></PageBoundary>;
   return <Shell />;
 }
 

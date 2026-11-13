@@ -3,6 +3,7 @@
 #include "AgentWatchdog.h"
 #include "Liveness.h"
 #include "LocalAdminRotation.h"
+#include "MemoryScanner.h"
 #include "TemporaryAdmin.h"
 #include "CrashReporter.h"
 #include "SystemProfile.h"
@@ -1073,6 +1074,9 @@ AgentService::~AgentService() {
   if (firewallThread_.joinable()) {
     firewallThread_.join();  // bounded by the script's three-minute timeout
   }
+  if (dnsRuleThread_.joinable()) {
+    dnsRuleThread_.join();  // bounded by the script's one-minute timeout
+  }
   if (wakeEvent_ != nullptr) {
     CloseHandle(wakeEvent_);
     wakeEvent_ = nullptr;
@@ -1179,6 +1183,7 @@ int AgentService::Run(const AgentRunMode mode) {
     }
 
     RunSyncLoop(mode);
+    StopDnsProxy();  // first: lookups go back to the network's DNS before anything else stops
     StopRealtimeChannel();
     DrainProcessTelemetry();
     DrainRansomwareTelemetry();
@@ -1222,6 +1227,7 @@ int AgentService::Run(const AgentRunMode mode) {
   } catch (const std::exception& error) {
     std::wcerr << L"Agent service failed to initialize: " << Utf8ToWide(error.what()) << std::endl;
     liveness::Stop();
+    StopDnsProxy();
     StopRealtimeChannel();  // a running thread left behind would crash the process on exit
     return 1;  // non-zero: Windows' recovery actions restart the service
   }
@@ -1298,6 +1304,12 @@ void AgentService::RunSyncLoop(const AgentRunMode mode) {
       if (GetTickCount64() - lastDefenderCheck_ > 6ULL * 60 * 60 * 1000) {
         lastDefenderCheck_ = GetTickCount64();
         CheckDefenderSelfProtection();
+      }
+      // Memory scan: 15 minutes after start, then hourly.
+      if (lastMemoryScan_ == 0) lastMemoryScan_ = GetTickCount64() - 45ULL * 60 * 1000;
+      if (GetTickCount64() - lastMemoryScan_ > 60ULL * 60 * 1000) {
+        lastMemoryScan_ = GetTickCount64();
+        StartMemoryScan();
       }
       if (GetTickCount64() - lastLocalAdminCheck_ > 60ULL * 60 * 1000 || lastLocalAdminCheck_ == 0) {
         lastLocalAdminCheck_ = GetTickCount64();
@@ -1915,6 +1927,18 @@ void AgentService::RefreshPolicy(const int cycle) {
   }
 
   const auto policyCheckIn = controlPlaneClient_->CheckInPolicy(state_);
+  if (!policyCheckIn.dnsOverHttpsUrl.empty()) {
+    std::error_code ec;
+    std::wstring saved;
+    {
+      std::wifstream in(DnsResolverUrlPath());
+      std::getline(in, saved);
+    }
+    if (saved != policyCheckIn.dnsOverHttpsUrl) {
+      std::filesystem::create_directories(DnsResolverUrlPath().parent_path(), ec);
+      std::wofstream(DnsResolverUrlPath(), std::ios::trunc) << policyCheckIn.dnsOverHttpsUrl;
+    }
+  }
   state_.lastPolicySyncAt = policyCheckIn.retrievedAt;
   state_.policy = policyCheckIn.policy;
   policy_ = policyCheckIn.policy;
@@ -1982,7 +2006,8 @@ void AgentService::PollAndExecuteCommands(const int cycle) {
 }
 
 bool AgentService::IsInteractiveCommand(const std::wstring& type) {
-  return type == L"remote.session.start" || type == L"remote.session.end";
+  // Admin access grants run here too, so a user waiting for one is never held up behind a scan or a patch.
+  return type == L"remote.session.start" || type == L"remote.session.end" || type == L"elevation.grant" || type == L"elevation.revoke";
 }
 
 void AgentService::ExecuteJournaledCommand(const RemoteCommand& command, const AgentState& identity) {
@@ -2083,7 +2108,7 @@ void AgentService::InteractiveCommandLoop() {
     const auto identity = IdentitySnapshot();
     if (!identity.deviceId.empty() && !ControlPlaneClient::DeviceApiKey(identity).empty()) {
       try {
-        const auto poll = controlPlaneClient_->PollPendingCommands(identity, 25, L"remote.session.start,remote.session.end");
+        const auto poll = controlPlaneClient_->PollPendingCommands(identity, 25, L"remote.session.start,remote.session.end,elevation.grant,elevation.revoke");
         for (const auto& command : poll.items) {
           if (IsInteractiveCommand(command.type)) {
             ExecuteJournaledCommand(command, identity);
@@ -3973,6 +3998,7 @@ void AgentService::ApplyProtectionPolicy() {
     QueueTelemetryEvent(record.eventType, record.source, record.summary, record.payloadJson);
   }
   ApplyFirewallPolicy();
+  ApplyDnsProxy();
   WriteExperienceFile();
   if (ransomwareShield_ && !policy_.modulesJson.empty()) {
     const auto extended = ExtendedPolicy::Parse(policy_.modulesJson);
@@ -4093,6 +4119,8 @@ struct ElevationGrant {
   long long until{0};
   bool wasAdmin{false};  // the user is already an administrator: no temporary account was needed
   std::wstring account, accountSid, kind, target, arguments;
+  bool launched{false};      // the service started the program itself (kind "run"), so the agent window does not
+  bool launchFailed{false};  // the service could not: the agent window starts it the older way instead
 };
 struct ElevationPending {
   std::wstring sid, requestId;
@@ -4131,7 +4159,8 @@ ElevationState LoadElevations(const std::filesystem::path& file) {
   if (const auto* grants = parsed->Get("grants"); grants && std::get_if<json::Array>(&grants->v)) {
     for (const auto& g : std::get<json::Array>(grants->v)) {
       state.grants.push_back({str(g, "sid"), str(g, "user"), str(g, "requestId"), num(g, "until"), flag(g, "wasAdmin"),
-                              str(g, "account"), str(g, "accountSid"), str(g, "kind"), str(g, "target"), str(g, "arguments")});
+                              str(g, "account"), str(g, "accountSid"), str(g, "kind"), str(g, "target"), str(g, "arguments"),
+                              flag(g, "launched"), flag(g, "launchFailed")});
     }
   }
   if (const auto* pending = parsed->Get("pending"); pending && std::get_if<json::Array>(&pending->v)) {
@@ -4155,7 +4184,7 @@ void SaveElevations(const std::filesystem::path& file, const ElevationState& sta
     body += (i ? L"," : L"") + std::wstring(L"{\"sid\":") + q(g.sid) + L",\"user\":" + q(g.user) + L",\"requestId\":" +
             q(g.requestId) + L",\"until\":" + std::to_wstring(g.until) + L",\"wasAdmin\":" + b(g.wasAdmin) + L",\"account\":" +
             q(g.account) + L",\"accountSid\":" + q(g.accountSid) + L",\"kind\":" + q(g.kind) + L",\"target\":" + q(g.target) +
-            L",\"arguments\":" + q(g.arguments) + L"}";
+            L",\"arguments\":" + q(g.arguments) + L",\"launched\":" + b(g.launched) + L",\"launchFailed\":" + b(g.launchFailed) + L"}";
   }
   body += L"],\"pending\":[";
   for (std::size_t i = 0; i < state.pending.size(); ++i) {
@@ -4200,9 +4229,9 @@ std::wstring AgentService::RequestElevation(const RemoteCommand& command) {
   const auto modules = ModulesJsonCopy();  // the local pipe runs on its own thread
   const auto root = modules.empty() ? std::optional<json::Value>{} : json::Parse(modules);
   const auto* privilege = root && root->IsObject() ? root->Get("privilege") : nullptr;
-  const auto* enabled = privilege ? privilege->Get("enabled") : nullptr;
+  // The cloud sends the effective setting (requests on their own, or allowed by an allowance on this device).
   const auto* mode = privilege ? privilege->Get("elevationRequests") : nullptr;
-  if (!enabled || !enabled->Bool().value_or(false) || (mode && mode->String().value_or("approval") == "off")) {
+  if (!mode || mode->String().value_or("off") == "off") {
     throw std::runtime_error("Admin access requests are turned off on this device.");
   }
   const auto user = command.issuedBy.substr(std::wstring(L"local-dashboard:").size());
@@ -4211,11 +4240,38 @@ std::wstring AgentService::RequestElevation(const RemoteCommand& command) {
   const auto target = ExtractPayloadString(command.payloadJson, "target").value_or(L"");
   const auto arguments = ExtractPayloadString(command.payloadJson, "arguments").value_or(L"");
   const bool run = !target.empty();
+  if (run) {
+    // Admin access already granted (a session): start the program straight away, nothing more to ask.
+    std::wstring requestId, account;
+    {
+      const std::lock_guard lock(elevationMutex_);
+      const auto state = LoadElevations(config_.runtimeDatabasePath.parent_path() / L"elevations.json");
+      const auto now = static_cast<long long>(std::time(nullptr));
+      for (const auto& grant : state.grants) {
+        if (grant.sid == command.callerSid && grant.until > now && grant.kind != L"run") requestId = grant.requestId, account = grant.account;
+      }
+    }
+    if (!requestId.empty()) {
+      std::wstring error;
+      if (!StartElevatedProgram(requestId, command.callerSid, account, target, arguments, false, &error)) {
+        throw std::runtime_error(WideToUtf8(error));
+      }
+      return L"{\"id\":" + Quoted(requestId) + L",\"status\":\"approved\",\"launched\":true}";
+    }
+  }
   std::string body = "{\"user\":\"" + EscapeJsonString(user.substr(0, 200)) + "\",\"userSid\":\"" +
                      EscapeJsonString(command.callerSid) + "\",\"reason\":\"" + EscapeJsonString(reason.substr(0, 1000)) +
                      "\",\"kind\":\"" + (run ? "run" : "session") + "\"";
   if (run) {
-    body += ",\"target\":\"" + EscapeJsonString(target.substr(0, 1024)) + "\",\"arguments\":\"" + EscapeJsonString(arguments.substr(0, 2000)) + "\"";
+    // What the device can vouch for about the program, for the policy's auto-approve rules.
+    std::wstring publisher, sha256;
+    try {
+      publisher = QueryFilePublisher(target);
+      sha256 = ComputeFileSha256(target);
+    } catch (const std::exception&) {
+    }
+    body += ",\"target\":\"" + EscapeJsonString(target.substr(0, 1024)) + "\",\"arguments\":\"" + EscapeJsonString(arguments.substr(0, 2000)) +
+            "\",\"publisher\":\"" + EscapeJsonString(publisher.substr(0, 200)) + "\",\"sha256\":\"" + EscapeJsonString(sha256) + "\"";
   }
   body += "}";
   const auto response = controlPlaneClient_->RequestElevation(IdentitySnapshot(), body);
@@ -4243,7 +4299,9 @@ std::wstring AgentService::ElevationStatus(const RemoteCommand& command) {
     if (grant.sid != command.callerSid || grant.until <= now) continue;
     std::wstring out = L"{\"state\":\"granted\",\"until\":\"" + UnixToIso(grant.until) + L"\",\"requestId\":" + Quoted(grant.requestId) +
                        L",\"kind\":" + Quoted(grant.kind.empty() ? L"session" : grant.kind) + L",\"target\":" + Quoted(grant.target) +
-                       L",\"arguments\":" + Quoted(grant.arguments);
+                       L",\"arguments\":" + Quoted(grant.arguments) + L",\"launched\":" + (grant.launched ? L"true" : L"false") +
+                       L",\"launchFailed\":" + (grant.launchFailed ? L"true" : L"false") +
+                       L",\"running\":" + (ElevatedProgramsRunningLocked(grant.requestId) ? L"true" : L"false");
     if (!grant.account.empty()) {
       auto& password = elevationPasswords_[grant.requestId];
       if (password.empty()) {
@@ -4305,6 +4363,28 @@ std::wstring AgentService::GrantElevation(const RemoteCommand& command) {
     if (!password.empty()) elevationPasswords_[requestId] = password;
   }
   SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+  if (kind == L"run" && !target.empty()) {
+    // The service starts the program itself, elevated on the user's desktop: no password, no Windows prompt, and it
+    // works whether or not the agent window is open. Creating the account's profile can take a few seconds, so it
+    // runs on its own thread; if it cannot, the agent window starts it the older way (the user confirms a prompt).
+    std::thread([this, requestId, sid, account, target, arguments]() {
+      std::wstring error;
+      if (!StartElevatedProgram(requestId, sid, account, target, arguments, true, &error)) {
+        {
+          const std::lock_guard lock(elevationMutex_);
+          const auto file = config_.runtimeDatabasePath.parent_path() / L"elevations.json";
+          auto state = LoadElevations(file);
+          for (auto& grant : state.grants) {
+            if (grant.requestId == requestId) grant.launchFailed = true;
+          }
+          SaveElevations(file, state);
+        }
+        QueueTelemetryEvent(L"elevation.launch.fallback", L"local-security",
+                            L"The service could not start " + target + L" itself (" + error + L"); the agent window will.",
+                            L"{\"requestId\":" + Quoted(requestId) + L",\"error\":" + Quoted(error) + L"}");
+      }
+    }).detach();
+  }
   QueueTelemetryEvent(L"elevation.granted", L"local-security",
                       wasAdmin ? user + L" is already an administrator; no temporary account was needed."
                                : L"Temporary administrator " + account + L" was created for " + user + L" for " + std::to_wstring(minutes) + L" minutes.",
@@ -4321,6 +4401,15 @@ void AgentService::EndElevationLocked(ElevationStateRef stateRef, const std::wst
   const auto it = std::find_if(state.grants.begin(), state.grants.end(), [&](const ElevationGrant& g) { return g.requestId == requestId; });
   if (it == state.grants.end()) return;
   ElevationCleanup cleanup{it->requestId, it->account, it->accountSid, reason, true, false};
+  // Programs started with this access close with it (revoked, time up, or the user said they were done).
+  if (auto launches = elevationLaunches_.find(requestId); launches != elevationLaunches_.end()) {
+    for (auto& launch : launches->second) {
+      tempadmin::Terminate(*launch);
+      if (launch->process != nullptr) WaitForSingleObject(static_cast<HANDLE>(launch->process), 3000);
+      tempadmin::Release(launch.get());  // unloads the profile, so it can be deleted with the account
+    }
+    elevationLaunches_.erase(launches);
+  }
   unsigned long status = 0;
   if (!it->account.empty()) {
     bool profileRemoved = false;
@@ -4426,7 +4515,11 @@ void AgentService::ExpireElevations() {
   const auto now = static_cast<long long>(std::time(nullptr));
   std::vector<std::wstring> due;
   for (const auto& grant : state.grants) {
-    if (grant.until <= now) due.push_back(grant.requestId);
+    if (grant.until > now) continue;
+    // A program started for a "run" request keeps its access while it is open (an installer still working), up to
+    // 8 hours past the time limit.
+    if (grant.kind == L"run" && ElevatedProgramsRunningLocked(grant.requestId) && now < grant.until + 8 * 3600) continue;
+    due.push_back(grant.requestId);
   }
   for (const auto& id : due) EndElevationLocked(&state, id, L"time limit reached");
   // Retry what an earlier end could not finish: a profile that was in use, a report the cloud did not get.
@@ -4449,6 +4542,135 @@ void AgentService::ExpireElevations() {
   }
   std::erase_if(state.pending, [now](const ElevationPending& p) { return now - p.at > 24 * 3600; });
   SaveElevations(file, state);
+}
+
+bool AgentService::ElevatedProgramsRunningLocked(const std::wstring& requestId) {
+  const auto found = elevationLaunches_.find(requestId);
+  if (found == elevationLaunches_.end()) return false;
+  return std::any_of(found->second.begin(), found->second.end(), [](const auto& launch) { return tempadmin::RunningProcesses(*launch) > 0; });
+}
+
+bool AgentService::StartElevatedProgram(const std::wstring& requestId, const std::wstring& sid, const std::wstring& account,
+                                        const std::wstring& target, const std::wstring& arguments, const bool endWhenClosed,
+                                        std::wstring* error) {
+  const auto session = tempadmin::FindUserSession(sid);
+  if (session == tempadmin::kNoSession) {
+    if (error) *error = L"the user is not signed in";
+    return false;
+  }
+  auto launch = std::make_shared<tempadmin::Launch>();
+  unsigned long status = 0;
+  std::wstring step;
+  {
+    const std::lock_guard lock(elevationMutex_);
+    std::wstring password;
+    if (!account.empty()) {
+      auto& known = elevationPasswords_[requestId];
+      if (known.empty()) {
+        // The service restarted and no longer knows it: give the account a new one.
+        known = laps::GeneratePassword(20);
+        if (tempadmin::SetPassword(account, known) != 0) known.clear();
+      }
+      password = known;
+    }
+    status = tempadmin::LaunchElevated(account, password, session, target, arguments, launch.get(), &step);
+    SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+    if (status == 0) {
+      elevationLaunches_[requestId].push_back(launch);
+      const auto file = config_.runtimeDatabasePath.parent_path() / L"elevations.json";
+      auto state = LoadElevations(file);
+      for (auto& grant : state.grants) {
+        if (grant.requestId == requestId && grant.kind == L"run") grant.launched = true;
+      }
+      SaveElevations(file, state);
+    }
+  }
+  if (status != 0) {
+    if (error) *error = L"could not " + step + L" (Windows error " + std::to_wstring(status) + L")";
+    return false;
+  }
+  const auto who = account.empty() ? std::wstring(L"the user's own administrator rights") : L"temporary administrator " + account;
+  QueueTelemetryEvent(L"elevation.program.launched", L"local-security", target + L" was started elevated with " + who + L".",
+                      L"{\"requestId\":" + Quoted(requestId) + L",\"account\":" + Quoted(account) + L",\"target\":" + Quoted(target) +
+                          L",\"pid\":" + std::to_wstring(launch->pid) + L",\"by\":\"service\"}");
+  try {
+    controlPlaneClient_->ReportElevationEvent(IdentitySnapshot(), requestId,
+                                              "{\"type\":\"launched\",\"account\":\"" + EscapeJsonString(account) + "\",\"target\":\"" +
+                                                  EscapeJsonString(target) + "\",\"pid\":" + std::to_string(launch->pid) + "}");
+  } catch (const std::exception&) {
+  }
+  std::thread([this, requestId, launch, endWhenClosed]() { WatchElevatedProgram(requestId, launch, endWhenClosed); }).detach();
+  return true;
+}
+
+void AgentService::WatchElevatedProgram(std::wstring requestId, std::shared_ptr<tempadmin::Launch> launch, const bool endWhenClosed) {
+  while (true) {
+    {
+      const std::lock_guard lock(elevationMutex_);
+      if (launch->process == nullptr && launch->job == nullptr) return;  // already ended with its access
+      if (tempadmin::RunningProcesses(*launch) == 0) {
+        tempadmin::Release(launch.get());
+        auto found = elevationLaunches_.find(requestId);
+        if (found != elevationLaunches_.end()) {
+          std::erase(found->second, launch);
+          if (found->second.empty()) elevationLaunches_.erase(found);
+        }
+        if (endWhenClosed && elevationLaunches_.find(requestId) == elevationLaunches_.end()) {
+          const auto file = config_.runtimeDatabasePath.parent_path() / L"elevations.json";
+          auto state = LoadElevations(file);
+          EndElevationLocked(&state, requestId, L"the program closed");
+          SaveElevations(file, state);
+        }
+        return;
+      }
+    }
+    if (stopEvent_ != nullptr && WaitForSingleObject(stopEvent_, 2000) == WAIT_OBJECT_0) return;
+  }
+}
+
+// "Run as administrator with Fenrir" on programs and installers in Explorer, while admin access requests are on.
+// It sends the request through the agent window (--pam-run), so the same policy, allowances and audit apply.
+void AgentService::ApplyElevationShellMenu(const bool on) {
+  if (elevationMenuState_ == (on ? 1 : 0)) return;
+  const auto client = (config_.installRootPath / L"fenrir-endpoint-client.exe").wstring();
+  struct Entry { const wchar_t* key; std::wstring command; };
+  const Entry entries[] = {
+      {L"SOFTWARE\\Classes\\exefile\\shell\\FenrirRunAsAdmin",
+       L"\"" + client + L"\" --pam-run \"%1\" --pam-reason \"Run as administrator from Explorer\""},
+      {L"SOFTWARE\\Classes\\Msi.Package\\shell\\FenrirRunAsAdmin",
+       L"\"" + client + L"\" --pam-run \"%1\" --pam-reason \"Install as administrator from Explorer\""},
+      {L"SOFTWARE\\Classes\\batfile\\shell\\FenrirRunAsAdmin",
+       L"\"" + client + L"\" --pam-run \"%1\" --pam-reason \"Run as administrator from Explorer\""},
+      {L"SOFTWARE\\Classes\\cmdfile\\shell\\FenrirRunAsAdmin",
+       L"\"" + client + L"\" --pam-run \"%1\" --pam-reason \"Run as administrator from Explorer\""},
+  };
+  bool ok = true;
+  for (const auto& entry : entries) {
+    if (!on) {
+      const auto status = RegDeleteTreeW(HKEY_LOCAL_MACHINE, entry.key);
+      ok = ok && (status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND);
+      continue;
+    }
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, entry.key, 0, nullptr, 0, KEY_WRITE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+      ok = false;
+      continue;
+    }
+    const std::wstring label = L"Run as administrator with Fenrir";
+    RegSetValueExW(key, nullptr, 0, REG_SZ, reinterpret_cast<const BYTE*>(label.c_str()), static_cast<DWORD>((label.size() + 1) * sizeof(wchar_t)));
+    const std::wstring icon = client + L",0";
+    RegSetValueExW(key, L"Icon", 0, REG_SZ, reinterpret_cast<const BYTE*>(icon.c_str()), static_cast<DWORD>((icon.size() + 1) * sizeof(wchar_t)));
+    HKEY commandKey = nullptr;
+    if (RegCreateKeyExW(key, L"command", 0, nullptr, 0, KEY_WRITE, nullptr, &commandKey, nullptr) == ERROR_SUCCESS) {
+      RegSetValueExW(commandKey, nullptr, 0, REG_SZ, reinterpret_cast<const BYTE*>(entry.command.c_str()),
+                     static_cast<DWORD>((entry.command.size() + 1) * sizeof(wchar_t)));
+      RegCloseKey(commandKey);
+    } else {
+      ok = false;
+    }
+    RegCloseKey(key);
+  }
+  if (ok) elevationMenuState_ = on ? 1 : 0;
 }
 
 PolicySnapshot AgentService::EnforcedPolicy() const {
@@ -4551,6 +4773,89 @@ void AgentService::MaybeCollectSystemProfile() {
     } catch (const std::exception& error) {
       record(L"inventory.profile.failed", L"The system profile could not be collected or sent.",
              L"{\"error\":\"" + Utf8ToWide(EscapeJsonString(Utf8ToWide(error.what()))) + L"\"}");
+    }
+    busy->store(false);
+  }).detach();
+}
+
+// edr.memoryScanning: injected or unpacked program images in running processes (see MemoryScanner.h). Runs on its
+// own low-priority thread on copies, like background scans. Malware the engine confirms is ended, unless it is in a
+// Windows process (ending one of those could take the machine down); everything found is reported.
+void AgentService::StartMemoryScan() {
+  const auto extended = policy_.modulesJson.empty() ? ExtendedPolicy{} : ExtendedPolicy::Parse(policy_.modulesJson);
+  if (!extended.memoryScanning) return;
+  bool expected = false;
+  if (!memoryScanBusy_->compare_exchange_strong(expected, true)) return;
+  auto busy = memoryScanBusy_;
+  auto stopping = stopRequested_;
+  const auto config = config_;
+  const auto policy = state_.policy;
+  std::thread([busy, stopping, config, policy]() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    const TelemetryQueueStore queue(config.runtimeDatabasePath, config.telemetryQueuePath);
+    const auto record = [&](const std::wstring& type, const std::wstring& summary, const std::wstring& payload) {
+      try {
+        queue.Append({TelemetryRecord{.eventId = GenerateGuidString(), .eventType = type, .source = L"memory-scanner",
+                                      .summary = summary, .occurredAt = CurrentUtcTimestamp(), .payloadJson = payload}});
+      } catch (...) {
+      }
+    };
+    const auto json = [](const std::wstring& value) { return L"\"" + Utf8ToWide(EscapeJsonString(value)) + L"\""; };
+    wchar_t windowsDir[MAX_PATH]{};
+    GetWindowsDirectoryW(windowsDir, MAX_PATH);
+    auto windowsLower = std::wstring(windowsDir) + L"\\";
+    std::transform(windowsLower.begin(), windowsLower.end(), windowsLower.begin(), ::towlower);
+    try {
+      const auto workDir = config.runtimeDatabasePath.parent_path() / L"memscan";
+      const auto summary = memscan::ScanProcesses(policy, workDir, *stopping);
+      int malicious = 0;
+      for (const auto& finding : summary.findings) {
+        const bool confirmed = finding.verdict && (finding.verdict->verdict.disposition == VerdictDisposition::Block ||
+                                                   finding.verdict->verdict.disposition == VerdictDisposition::Quarantine);
+        auto imageLower = finding.image;
+        std::transform(imageLower.begin(), imageLower.end(), imageLower.begin(), ::towlower);
+        const bool windowsProcess = imageLower.rfind(windowsLower, 0) == 0;
+        const bool hostSigned = !finding.image.empty() && VerifyFileAuthenticodeSignature(finding.image);
+        std::wstring action = L"reported";
+        if (confirmed && !windowsProcess) {
+          if (const auto process = OpenProcess(PROCESS_TERMINATE, FALSE, finding.pid)) {
+            if (TerminateProcess(process, 1)) action = L"terminated";
+            CloseHandle(process);
+          }
+        }
+        wchar_t address[32]{};
+        swprintf_s(address, L"0x%llX", finding.address);
+        std::wstring payload = L"{\"rule\":\"edr.memoryScanning\",\"pid\":" + std::to_wstring(finding.pid) +
+                               L",\"processImagePath\":" + json(finding.image) + L",\"address\":\"" + address +
+                               L"\",\"size\":" + std::to_wstring(finding.size) + L",\"signed\":" +
+                               (hostSigned ? L"true" : L"false") + L",\"action\":\"" + action + L"\",\"technique\":\"T1055\"";
+        if (confirmed) {
+          ++malicious;
+          const auto& verdict = finding.verdict->verdict;
+          payload += L",\"confidence\":" + std::to_wstring(verdict.confidence);
+          if (!verdict.reasons.empty()) {
+            payload += L",\"threat\":" + json(verdict.reasons.front().code) + L",\"reason\":" + json(verdict.reasons.front().message);
+          }
+        }
+        payload += L"}";
+        const auto name = std::filesystem::path(finding.image).filename().wstring();
+        if (confirmed) {
+          record(L"asr.memory.malware",
+                 (action == L"terminated" ? L"Ended " : L"Found malware in the memory of ") + name +
+                     (action == L"terminated" ? L": malware found in its memory" : L""),
+                 payload);
+        } else {
+          record(hostSigned ? L"asr.memory.injected_code_signed" : L"asr.memory.injected_code",
+                 L"A program image is running from memory no file backs, inside " + name + L" (injected or unpacked code)",
+                 payload);
+        }
+      }
+      record(L"edr.memory.scan.completed", L"Memory scan finished",
+             L"{\"processes\":" + std::to_wstring(summary.processes) + L",\"skipped\":" + std::to_wstring(summary.skipped) +
+                 L",\"images\":" + std::to_wstring(summary.images) + L",\"malicious\":" + std::to_wstring(malicious) + L"}");
+    } catch (const std::exception& error) {
+      record(L"edr.memory.scan.failed", L"The memory scan could not complete",
+             L"{\"error\":" + json(Utf8ToWide(error.what())) + L"}");
     }
     busy->store(false);
   }).detach();
@@ -4795,8 +5100,10 @@ void AgentService::WriteExperienceFile() {
   }
   {
     const auto* privilege = section("privilege");
-    const auto mode = flag(privilege, "enabled", false) ? text(privilege, "elevationRequests", "approval") : std::string("off");
-    out += ",\"elevationRequests\":" + q(mode == "auto-approve" || mode == "approval" ? mode : "off");
+    auto mode = text(privilege, "elevationRequests", "off");
+    if (mode != "auto-approve" && mode != "approval") mode = "off";
+    out += ",\"elevationRequests\":" + q(mode);
+    if (!laps::IsDomainController()) ApplyElevationShellMenu(mode != "off");
   }
   out += "}";
   try {
@@ -5003,6 +5310,196 @@ bool AgentService::RunFirewallScript(const std::string& script, const std::wstri
     QueueTelemetryEvent(L"firewall.apply_failed", L"firewall", L"Firewall policy could not be applied",
                         L"{\"error\":\"" + Utf8ToWide(EscapeJsonString(Utf8ToWide(error.what()))) + L"\"}");
     return false;
+  }
+}
+
+// --------------------------------------------------------------------------- local DNS proxy (DnsProxy.h)
+
+std::filesystem::path AgentService::DnsMarkerPath() const {
+  return config_.runtimeDatabasePath.parent_path() / L"dns-proxy.json";
+}
+
+std::filesystem::path AgentService::DnsResolverUrlPath() const {
+  return config_.runtimeDatabasePath.parent_path() / L"dns-resolver-url.txt";
+}
+
+void AgentService::ApplyDnsProxy() {
+  const auto settings = policy_.modulesJson.empty() ? dnsproxy::Settings{} : dnsproxy::Parse(policy_.modulesJson);
+  std::wstring url;
+  {
+    std::wifstream in(DnsResolverUrlPath());
+    std::getline(in, url);
+  }
+  std::string skip;
+  if (settings.enabled && url.empty()) {
+    skip = "waiting for this device's DNS address from the server (sent with the next policy check-in)";
+  } else if (settings.enabled && dnsproxy::IsDomainControllerOrDnsServer()) {
+    skip = "domain controllers and DNS servers answer DNS themselves, so the local proxy is not used on them";
+  }
+  std::string config = "off";
+  if (settings.enabled && skip.empty()) {
+    config = WideToUtf8(url) + "|" + (settings.failClosed ? "closed" : "open") + "|" + std::to_string(settings.cacheMinutes);
+    for (const auto& domain : settings.localDomains) config += "|" + domain;
+  }
+  std::error_code ec;
+  const bool marker = std::filesystem::exists(DnsMarkerPath(), ec);
+  if (config == dnsProxyConfig_) {
+    // Running, but the rule is gone (the watchdog removed it, or applying it failed): try again every 10 minutes.
+    if (dnsProxy_ && !marker && GetTickCount64() - lastDnsRuleAttemptMs_ > 10ULL * 60 * 1000) RequestDnsRule(true);
+    return;
+  }
+  dnsProxyConfig_ = config;
+  if (!skip.empty() && skip != dnsSkipReported_) {
+    dnsSkipReported_ = skip;
+    QueueTelemetryEvent(L"dns.proxy.skipped", L"dns-proxy", L"Local DNS proxy not started: " + Utf8ToWide(skip),
+                        L"{\"reason\":\"" + Utf8ToWide(EscapeJsonString(Utf8ToWide(skip))) + L"\"}");
+  }
+  if (config == "off") {
+    if (dnsProxy_ || marker) {
+      StopDnsProxy();
+      QueueTelemetryEvent(L"dns.proxy.stopped", L"dns-proxy", L"Local DNS proxy stopped; lookups use the network's DNS again", L"{}");
+    }
+    return;
+  }
+
+  dnsproxy::Options options;
+  options.dohUrl = url;
+  const auto& channel = state_.commandChannelUrl;
+  if (const auto at = channel.find(L"deviceApiKey="); at != std::wstring::npos) {
+    options.apiKey = channel.substr(at + 13, channel.find(L'&', at) == std::wstring::npos ? std::wstring::npos : channel.find(L'&', at) - at - 13);
+  }
+  options.failClosed = settings.failClosed;
+  options.cacheMinutes = settings.cacheMinutes;
+  options.localDomains = settings.localDomains;
+  options.onCachedBlock = [this](const std::string& domain, const std::string& reason) {
+    QueueTelemetryEvent(L"dns.blocked", L"dns-proxy", L"Blocked DNS lookup " + Utf8ToWide(domain) + L" (remembered block)",
+                        L"{\"queryName\":\"" + Utf8ToWide(EscapeJsonString(Utf8ToWide(domain))) + L"\",\"reason\":\"" +
+                            Utf8ToWide(EscapeJsonString(Utf8ToWide(reason))) + L"\",\"verdict\":\"block\",\"cached\":true}");
+  };
+  if (dnsProxy_) {  // new settings: the rule stays, the proxy is replaced (a gap of milliseconds)
+    dnsProxy_->Stop();
+    dnsProxy_.reset();
+  }
+  auto proxy = std::make_unique<dnsproxy::Proxy>(std::move(options));
+  std::string error;
+  if (!proxy->Start(&error) || !dnsproxy::Probe(dnsproxy::kListenAddress, 53, 2000)) {
+    if (error.empty()) error = "the proxy did not answer its own health check";
+    proxy.reset();
+    if (marker) {
+      dnsRuleWanted_ = 0;
+      std::lock_guard scriptLock(dnsScriptMutex_);
+      SetDnsRuleNow(false);
+    }
+    dnsProxyConfig_.clear();  // try again at the next policy check-in
+    QueueTelemetryEvent(L"dns.proxy.failed", L"dns-proxy", L"Local DNS proxy could not start: " + Utf8ToWide(error),
+                        L"{\"error\":\"" + Utf8ToWide(EscapeJsonString(Utf8ToWide(error))) + L"\"}");
+    return;
+  }
+  dnsProxy_ = std::move(proxy);
+  dnsSkipReported_.clear();
+  QueueTelemetryEvent(L"dns.proxy.started", L"dns-proxy",
+                      std::wstring(L"Local DNS proxy answering on 127.77.0.53 (when Fenrir is unreachable: ") +
+                          (settings.failClosed ? L"refuse" : L"use the network's DNS") + L")",
+                      std::wstring(L"{\"failMode\":\"") + (settings.failClosed ? L"closed" : L"open") + L"\",\"cacheMinutes\":" +
+                          std::to_wstring(settings.cacheMinutes) + L",\"localDomains\":" + std::to_wstring(settings.localDomains.size()) + L"}");
+  RequestDnsRule(true);
+}
+
+void AgentService::StopDnsProxy() {
+  std::error_code ec;
+  if (dnsProxy_ || std::filesystem::exists(DnsMarkerPath(), ec)) {
+    dnsRuleWanted_ = 0;
+    std::lock_guard scriptLock(dnsScriptMutex_);
+    SetDnsRuleNow(false);
+  }
+  {
+    std::unique_lock lock(dnsRuleMutex_);
+    if (!dnsRuleBusy_ && dnsRuleThread_.joinable()) {
+      lock.unlock();
+      dnsRuleThread_.join();
+    }
+  }
+  if (dnsProxy_) {
+    dnsProxy_->Stop();
+    dnsProxy_.reset();
+  }
+  dnsProxyConfig_.clear();
+}
+
+void AgentService::RequestDnsRule(bool apply) {
+  dnsRuleWanted_ = apply ? 1 : 0;
+  lastDnsRuleAttemptMs_ = GetTickCount64();
+  std::lock_guard lock(dnsRuleMutex_);
+  if (dnsRuleBusy_) return;  // the worker checks dnsRuleWanted_ again when it finishes
+  if (dnsRuleThread_.joinable()) dnsRuleThread_.join();
+  dnsRuleBusy_ = true;
+  dnsRuleThread_ = std::thread([this] { DnsRuleWorker(); });
+}
+
+void AgentService::DnsRuleWorker() {
+  int done = -1;
+  for (;;) {
+    {
+      std::lock_guard lock(dnsRuleMutex_);
+      if (dnsRuleWanted_ == done || dnsRuleWanted_ < 0) {
+        dnsRuleBusy_ = false;
+        return;
+      }
+    }
+    std::lock_guard scriptLock(dnsScriptMutex_);
+    const int wanted = dnsRuleWanted_;
+    if (wanted < 0) continue;
+    SetDnsRuleNow(wanted == 1);
+    done = wanted;
+  }
+}
+
+void AgentService::SetDnsRuleNow(bool apply) {
+  const auto workRoot = config_.runtimeDatabasePath.parent_path() / L"rmm" / L"dns";
+  std::error_code ec;
+  std::filesystem::create_directories(workRoot, ec);
+  const auto path = workRoot / (apply ? L"apply-dns-rule.ps1" : L"remove-dns-rule.ps1");
+  {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file << "\xEF\xBB\xBF" << (apply ? dnsproxy::BuildApplyScript() : dnsproxy::BuildRemoveScript());
+  }
+  wchar_t systemDir[MAX_PATH]{};
+  GetSystemDirectoryW(systemDir, MAX_PATH);
+  const std::wstring command = L"\"" + std::wstring(systemDir) +
+                               L"\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" +
+                               path.wstring() + L"\"";
+  std::string output;
+  bool ran = false;
+  try {
+    const auto result = rmm::RunProcess(command, workRoot.wstring(), {}, 60 * 1000);
+    ran = !result.timedOut;
+    output = result.stdoutText;
+  } catch (const std::exception& error) {
+    output = std::string("{\"ok\":false,\"reason\":\"") + EscapeJsonString(Utf8ToWide(error.what())) + "\"}";
+  }
+  std::filesystem::remove(path, ec);
+  while (!output.empty() && (output.back() == '\n' || output.back() == '\r' || output.back() == ' ')) output.pop_back();
+  const auto parsed = json::Parse(output);
+  const bool ok = ran && parsed && parsed->IsObject() && parsed->Get("ok") && parsed->Get("ok")->Bool().value_or(false);
+  std::string reason = parsed && parsed->IsObject() && parsed->Get("reason") ? parsed->Get("reason")->String().value_or("") : "";
+  if (!ran) reason = "PowerShell did not finish within a minute";
+  if (apply) {
+    if (ok) {
+      dnsRuleFailureReported_.clear();
+      std::ofstream(DnsMarkerPath(), std::ios::trunc) << "{\"listen\":\"" << dnsproxy::kListenAddress << "\",\"rule\":\"" << dnsproxy::kRuleComment << "\"}";
+      QueueTelemetryEvent(L"dns.proxy.rule_applied", L"dns-proxy", L"Windows now sends DNS lookups to the Fenrir DNS proxy", L"{}");
+    } else if (reason != dnsRuleFailureReported_) {  // retried every 10 minutes; reported when the reason changes
+      dnsRuleFailureReported_ = reason;
+      QueueTelemetryEvent(L"dns.proxy.rule_failed", L"dns-proxy", L"Windows could not be pointed at the Fenrir DNS proxy: " + Utf8ToWide(reason),
+                          L"{\"reason\":\"" + Utf8ToWide(EscapeJsonString(Utf8ToWide(reason))) + L"\"}");
+    }
+  } else {
+    if (ok) {
+      std::filesystem::remove(DnsMarkerPath(), ec);
+    } else {
+      QueueTelemetryEvent(L"dns.proxy.rule_failed", L"dns-proxy", L"The Fenrir DNS rule could not be removed: " + Utf8ToWide(reason),
+                          L"{\"reason\":\"" + Utf8ToWide(EscapeJsonString(Utf8ToWide(reason))) + L"\"}");
+    }
   }
 }
 

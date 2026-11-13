@@ -13,7 +13,7 @@ import { PushCard } from "../components/PushCard";
 import { BrandingSettings } from "../components/BrandingSettings";
 import { ModulesSettings } from "../components/ModulesSettings";
 
-const ROLES = ["platform_admin", "msp_admin", "soc_analyst", "technician", "billing", "tenant_admin", "tenant_analyst", "viewer", "carer"];
+const ROLES = ["platform_admin", "msp_admin", "soc_analyst", "technician", "billing", "tenant_admin", "tenant_analyst", "viewer"];
 
 export default function Settings() {
   const { can } = useApp();
@@ -106,7 +106,7 @@ function UsersTab() {
   const { run, busy } = useAction();
   const customRoles: any[] = roleData?.custom || [];
   const roleLabel = (role: string) => customRoles.find((r) => r.role === role)?.name || role.replace(/_/g, " ");
-  const roleOptions = [...ROLES.map((r) => ({ value: r, label: r === "carer" ? "carer (family: Care page only)" : r.replace(/_/g, " ") })), ...customRoles.map((r) => ({ value: r.role, label: `${r.name} (custom)` }))];
+  const roleOptions = [...ROLES.map((r) => ({ value: r, label: r.replace(/_/g, " ") })), ...customRoles.map((r) => ({ value: r.role, label: `${r.name} (custom)` }))];
   return (
     <div className="card">
       {can("configure") && roleData && (
@@ -184,8 +184,8 @@ function GroupsTab() {
 // Every event the server sends to webhooks (services.fire_webhooks and the event outbox).
 const WEBHOOK_EVENTS: [string, string][] = [
   ["*", "Everything"], ["incident.created", "Incident opened"], ["alert.automation", "Response rule fired"], ["ticket.created", "Ticket created"],
-  ["network.down", "Monitored service down"], ["network.recovered", "Monitored service recovered"], ["backup.failed", "Backup failed"],
-  ["backup.success", "Backup succeeded"], ["vulnerability.detected", "Vulnerability found"], ["vulnerability.verified_fixed", "Vulnerability fixed"],
+  ["network.down", "Monitored service down"], ["network.recovered", "Monitored service recovered"],
+  ["vulnerability.detected", "Vulnerability found"], ["vulnerability.verified_fixed", "Vulnerability fixed"],
   ["grc.drift", "Compliance drift"], ["m365.action_finished", "Microsoft 365 action finished"], ["audit.checkpoint", "Audit checkpoint"],
   ["platform.health.degraded", "Fenrir platform degraded"], ["platform.health.recovered", "Fenrir platform recovered"],
 ];

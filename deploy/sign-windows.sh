@@ -27,7 +27,7 @@ PASSWORD_FILE=${CODESIGN_PASSWORD_FILE:-/run/secrets/codesign_password}
 AZURE_FILE=${CODESIGN_AZURE_FILE:-/run/secrets/codesign_azure}
 OUT=${SIGN_OUT:-/out/windows}
 SIGN_NAME=${FENRIR_CODESIGN_NAME:-Fenrir Endpoint}
-SIGN_URL=${FENRIR_CODESIGN_URL:-https://github.com/Palmertech-Webdev/fenrir-security}
+SIGN_URL=${FENRIR_CODESIGN_URL:-${FENRIR_PUBLIC_URL:-}}  # shown in Windows' signature details; your own site
 JSIGN_VERSION=7.2
 JSIGN_SHA256=9a99673bb011cc1d7faf00bc840a6b333fc8a9b596098da2f92946b68297f067
 JSIGN=${JSIGN_JAR:-/opt/jsign/jsign-$JSIGN_VERSION.jar}
@@ -56,6 +56,21 @@ MSG
   fi
   echo "sign-windows: lab profile: no code signing set up; the Windows build is UNSIGNED (unsigned-lab)."
   [ -f "$OUT/signing.json" ] || echo '{"signed": false, "profile": "lab"}' > "$OUT/signing.json"
+  # Windows will not load an unsigned kernel driver even in test-signing mode, so a lab build test-signs the
+  # minifilter (and only it) with a throwaway certificate. Test mode accepts that; nothing else trusts it.
+  DRIVERS=$(for target in "$@"; do [ -d "$target" ] && find "$target" -type f \( -iname '*.sys' -o -iname '*.cat' \); done | sort)
+  if [ -n "$DRIVERS" ] && command -v osslsigncode >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then
+    LABKEYS=$(mktemp -d); chmod 700 "$LABKEYS"
+    openssl req -x509 -newkey rsa:3072 -nodes -sha256 -days 30 -subj "/CN=Fenrir lab test driver signing" \
+      -addext "extendedKeyUsage=codeSigning" -keyout "$LABKEYS/key.pem" -out "$LABKEYS/cert.pem" >/dev/null 2>&1
+    echo "$DRIVERS" | while read -r f; do
+      if osslsigncode verify -in "$f" >/dev/null 2>&1; then continue; fi
+      osslsigncode sign -certs "$LABKEYS/cert.pem" -key "$LABKEYS/key.pem" -n "Fenrir minifilter (lab test signature)" \
+        -h sha256 -in "$f" -out "$f.signed" >/dev/null && mv "$f.signed" "$f" \
+        && echo "sign-windows: test-signed for Windows test mode only: $f"
+    done
+    rm -rf "$LABKEYS"
+  fi
   exit 0
 fi
 
@@ -184,7 +199,8 @@ sign_one() {
 
 for target in "$@"; do
   if [ -d "$target" ]; then
-    find "$target" -type f \( -iname '*.exe' -o -iname '*.dll' \) | sort | while read -r f; do sign_one "$f"; done
+    find "$target" -type f \( -iname '*.exe' -o -iname '*.dll' -o -iname '*.sys' -o -iname '*.cat' \) | sort \
+      | while read -r f; do sign_one "$f"; done
   else
     sign_one "$target"
   fi

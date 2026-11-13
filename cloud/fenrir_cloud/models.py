@@ -162,7 +162,7 @@ class Device(Base):
     exposure_flags: Mapped[list | None] = mapped_column(JSON, nullable=True)
     # Phones: lost mode ({"enabled", "message", "phone", "since", "by"}); the agent re-reads it on every heartbeat.
     lost_mode: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
-    # Phones looked after by family or carers (care.py): tracking level, carers, quiet/battery alerts, escalation, SOS.
+    # Unused: the Care feature (looked-after phones) was removed; the column is kept because migrations are never undone.
     care: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     # CORE-04 key rotation (devicekeys.py): the new key until its first use, when the key was last rotated, and a
     # technician's request to rotate at the next heartbeat.
@@ -351,6 +351,35 @@ class ElevationRequest(Base):
     account_sid: Mapped[str | None] = mapped_column(String(200), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     end_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # What the device verified about the program (kind "run"): its signature's publisher and SHA-256, used by the
+    # auto-approve rules and shown to technicians.
+    publisher: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    approved_by_rule: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    events: Mapped[list | None] = mapped_column(JSON, nullable=True)  # timeline: requested, decided, granted, launched, ended
+
+
+class ElevationAllowance(Base):
+    """A technician lets a user (or anyone) on a device, or on all of a customer's devices, get admin access without
+    asking each time. Requests that match are granted straight away, whatever the policy's request setting."""
+
+    __tablename__ = "elevation_allowances"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("ela"))
+    tenant_id: Mapped[str] = mapped_column(String(32), index=True)
+    device_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)  # null = every device of the customer
+    user: Mapped[str] = mapped_column(String(200), default="")      # "" = any user
+    user_sid: Mapped[str] = mapped_column(String(200), default="")  # when known, matched instead of the name
+    kinds: Mapped[str] = mapped_column(String(10), default="any")   # any | session | run
+    programs: Mapped[list] = mapped_column(JSON, default=list)      # run only: paths, wildcards or SHA-256; [] = any program
+    minutes: Mapped[int] = mapped_column(Integer, default=30)       # length of each admin session it grants
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # null = until revoked
+    note: Mapped[str] = mapped_column(String(500), default="")
+    created_by: Mapped[str] = mapped_column(String(200), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_by: Mapped[str] = mapped_column(String(200), default="")
+    uses: Mapped[int] = mapped_column(Integer, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     events: Mapped[list | None] = mapped_column(JSON, nullable=True)  # timeline: requested, decided, granted, launched, ended
 
 
@@ -551,6 +580,82 @@ class DnsQueryLog(Base):
     reason: Mapped[str] = mapped_column(String(200), default="")
     category: Mapped[str] = mapped_column(String(40), default="")
     at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # What decided (dns_rules.py): rule | entry | policy | intel | ruleset | blocklist | category | heuristic | safesearch
+    source: Mapped[str | None] = mapped_column(String(20), nullable=True, default="")
+    rule_id: Mapped[str | None] = mapped_column(String(32), nullable=True, default="")  # the DNS rule or list entry
+    score: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Fenrir ruleset confidence, when it decided
+
+
+class DnsRule(Base):
+    """A DNS rule or allow/block list entry (dns_rules.py). Rules on the MSP's own tenant apply to every customer.
+    kind "entry" is a simple allow/block list line; kind "rule" adds conditions (match type, scope, query types,
+    schedule) and can run in audit mode. Every change bumps ``version`` and is kept in ``dns_rule_changes``."""
+    __tablename__ = "dns_rules"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("dnr"))
+    tenant_id: Mapped[str] = mapped_column(String(32), index=True)
+    kind: Mapped[str] = mapped_column(String(10), default="rule")  # rule | entry
+    name: Mapped[str] = mapped_column(String(200), default="")
+    action: Mapped[str] = mapped_column(String(10), default="block")  # allow | block | monitor
+    match: Mapped[str] = mapped_column(String(10), default="domain")  # domain | exact | wildcard | regex | category
+    patterns: Mapped[list] = mapped_column(JSON, default=list)
+    scope_type: Mapped[str] = mapped_column(String(10), default="tenant")  # tenant | group | device
+    scope_ids: Mapped[list] = mapped_column(JSON, default=list)
+    qtypes: Mapped[list] = mapped_column(JSON, default=list)  # empty = every query type
+    schedule: Mapped[dict] = mapped_column(JSON, default=dict)  # {"days": [0..6], "start": "09:00", "end": "17:30"}
+    mode: Mapped[str] = mapped_column(String(10), default="enforce")  # enforce | audit
+    priority: Mapped[int] = mapped_column(Integer, default=100)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    comment: Mapped[str] = mapped_column(String(500), default="")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    hits: Mapped[int] = mapped_column(Integer, default=0)
+    last_hit_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_by: Mapped[str] = mapped_column(String(320), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class DnsRuleChange(Base):
+    """One version of a DNS rule: who changed what, and the whole rule as it was, so any version can be restored."""
+    __tablename__ = "dns_rule_changes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    rule_id: Mapped[str] = mapped_column(String(32), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(32), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    change: Mapped[str] = mapped_column(String(10), default="create")  # create | update | delete | restore
+    actor: Mapped[str] = mapped_column(String(320), default="")
+    comment: Mapped[str] = mapped_column(String(500), default="")
+    snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    changes: Mapped[list] = mapped_column(JSON, default=list)
+    at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class DnsRuleset(Base):
+    """A build of the Fenrir DNS ruleset (dns_ruleset.py): every domain the enabled feeds and threat intel name,
+    scored by how many independent sources agree, compressed. One build is active; older ones can be re-activated."""
+    __tablename__ = "dns_rulesets"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("dnrs"))
+    version: Mapped[int] = mapped_column(Integer, unique=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_by: Mapped[str] = mapped_column(String(320), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    settings: Mapped[dict] = mapped_column(JSON, default=dict)  # thresholds, weights and the sources used
+    stats: Mapped[dict] = mapped_column(JSON, default=dict)
+    diff: Mapped[dict] = mapped_column(JSON, default=dict)  # against the build that was active before
+    domain_count: Mapped[int] = mapped_column(Integer, default=0)
+    domains: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+
+
+class DnsDeviceDay(Base):
+    """Lookups and blocks per device per day, counted for every query (the query log only keeps what policy logs)."""
+    __tablename__ = "dns_device_days"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(32), index=True)
+    device_id: Mapped[str] = mapped_column(String(32), index=True)
+    day: Mapped[str] = mapped_column(String(10))  # YYYY-MM-DD (UTC)
+    queries: Mapped[int] = mapped_column(Integer, default=0)
+    blocked: Mapped[int] = mapped_column(Integer, default=0)
+    __table_args__ = (UniqueConstraint("device_id", "day", name="uq_dns_device_day"),)
 
 
 # --------------------------------------------------------------------------
@@ -2004,6 +2109,178 @@ class M365LogEntry(Base):
     target: Mapped[str] = mapped_column(String(320), default="")
     details: Mapped[dict] = mapped_column(JSON, default=dict)
     __table_args__ = (UniqueConstraint("connection_id", "kind", "external_id", name="uq_m365_log_entry"),)
+
+
+class EmailScanSetting(Base):
+    """Email security for one Microsoft 365 connection (email_scan.py): off, or shadow mode (scan and compare, act on
+    nothing). ``state`` keeps each mailbox's cursor: {"<user id>": {"inbox": iso, "junkemail": iso}}."""
+    __tablename__ = "email_scan_settings"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("emset"))
+    tenant_id: Mapped[str] = mapped_column(String(32), index=True)
+    connection_id: Mapped[str] = mapped_column(String(32), unique=True)
+    mode: Mapped[str] = mapped_column(String(10), default="off")  # off | shadow | protect
+    retention_days: Mapped[int] = mapped_column(Integer, default=90)
+    # Protect mode (email_actions.py): what to do per verdict, e.g. {"malware": "quarantine", "phish": "quarantine",
+    # "suspicious": "tag"}; when protect mode started (older mail is never touched); why it paused itself, if it did.
+    actions: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=dict)
+    protect_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    paused_reason: Mapped[str | None] = mapped_column(String(300), nullable=True, default="")
+    # {"digest": true, "alertEmail": "soc@msp.example", "openTicket": false}
+    notify: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=dict)
+    digest_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    state: Mapped[dict] = mapped_column(JSON, default=dict)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(String(300), default="")
+    last_scanned: Mapped[int] = mapped_column(Integer, default=0)
+    updated_by: Mapped[str] = mapped_column(String(320), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class EmailScan(Base):
+    """One message in one mailbox: Microsoft's verdict, Fenrir's verdict and why, and a technician's label if given.
+    Keeps the sender, subject and link domains for the console; never the message body."""
+    __tablename__ = "email_scans"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("emsc"))
+    tenant_id: Mapped[str] = mapped_column(String(32), index=True)
+    connection_id: Mapped[str] = mapped_column(String(32), index=True)
+    mailbox: Mapped[str] = mapped_column(String(320))
+    message_id: Mapped[str] = mapped_column(String(200))  # Microsoft Graph id in that mailbox
+    internet_message_id: Mapped[str] = mapped_column(String(300), default="")
+    received_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    folder: Mapped[str] = mapped_column(String(20), default="inbox")  # inbox | junkemail
+    sender_address: Mapped[str] = mapped_column(String(320), default="")
+    sender_name: Mapped[str] = mapped_column(String(200), default="")
+    sender_domain: Mapped[str] = mapped_column(String(255), default="", index=True)
+    subject: Mapped[str] = mapped_column(String(300), default="")
+    attachments: Mapped[list] = mapped_column(JSON, default=list)  # [{name, size, sha256}]
+    link_domains: Mapped[list] = mapped_column(JSON, default=list)
+    microsoft_verdict: Mapped[str] = mapped_column(String(10), default="unknown")  # unknown|clean|bulk|spam|phish|malware
+    microsoft: Mapped[dict] = mapped_column(JSON, default=dict)  # SCL, BCL, PCL, SFV, CAT, SPF, DKIM, DMARC, compauth
+    verdict: Mapped[str] = mapped_column(String(12), default="clean", index=True)  # clean|suspicious|phish|malware
+    score: Mapped[int] = mapped_column(Integer, default=0)
+    reasons: Mapped[list] = mapped_column(JSON, default=list)
+    agreement: Mapped[str] = mapped_column(String(16), default="neither", index=True)  # both|fenrir_only|microsoft_only|neither
+    features: Mapped[dict] = mapped_column(JSON, default=dict)  # numbers for training, no content
+    label: Mapped[str] = mapped_column(String(10), default="")  # "" | phish | malware | spam | safe (a technician's call)
+    labelled_by: Mapped[str] = mapped_column(String(320), default="")
+    labelled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    scanned_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # Where it came from: "graph" (read from the mailbox) or "gateway" (passed through Fenrir's mail gateway).
+    source: Mapped[str | None] = mapped_column(String(10), nullable=True, default="graph")
+    recipients: Mapped[list | None] = mapped_column(JSON, nullable=True, default=list)  # gateway: every recipient
+    # What Fenrir did (protect mode): "" | quarantine | junk | tag | deliver; and how that went:
+    # "" | done | failed | released | release_requested | skipped
+    action: Mapped[str | None] = mapped_column(String(12), nullable=True, default="")
+    action_status: Mapped[str | None] = mapped_column(String(20), nullable=True, default="")
+    action_error: Mapped[str | None] = mapped_column(String(300), nullable=True, default="")
+    acted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    moved_message_id: Mapped[str | None] = mapped_column(String(200), nullable=True, default="")  # its id after a move
+    released_by: Mapped[str | None] = mapped_column(String(320), nullable=True, default="")
+    released_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    release_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    model_score: Mapped[float | None] = mapped_column(Float, nullable=True)  # the learned model's probability (phase 3)
+    # The evidence (email_forensics.py): headers, delivery path, originating IP, addresses, authentication, links,
+    # attachments and, for the gateway, the hand-over to Microsoft 365.
+    details: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=dict)
+    __table_args__ = (UniqueConstraint("connection_id", "mailbox", "message_id", name="uq_email_scan_message"),)
+
+
+class EmailListEntry(Base):
+    """An allow or block entry for email security: a sender address or a whole domain, for one customer or (tenant_id
+    of the MSP's root) every customer below it. Allow wins over Fenrir's checks; block makes the message malicious."""
+    __tablename__ = "email_list_entries"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("emlst"))
+    tenant_id: Mapped[str] = mapped_column(String(32), index=True)
+    kind: Mapped[str] = mapped_column(String(5))  # allow | block
+    match: Mapped[str] = mapped_column(String(10))  # sender | domain
+    value: Mapped[str] = mapped_column(String(320))
+    note: Mapped[str] = mapped_column(String(300), default="")
+    created_by: Mapped[str] = mapped_column(String(320), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # match is also ip (address or range), url (domain or link), hash (SHA-256) or subject (words in the subject).
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    hits: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    last_hit_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    __table_args__ = (UniqueConstraint("tenant_id", "kind", "match", "value", name="uq_email_list_entry"),)
+
+
+class EmailPolicyVersion(Base):
+    """One saved version of a scope's email policy set (email_policy.py). Never changed after it is written."""
+    __tablename__ = "email_policy_versions"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("empol"))
+    tenant_id: Mapped[str] = mapped_column(String(32), index=True)  # the MSP (default for customers) or one customer
+    version: Mapped[int] = mapped_column(Integer)
+    document: Mapped[dict] = mapped_column(JSON, default=dict)
+    inherit: Mapped[bool] = mapped_column(Boolean, default=False)  # True: follow the parent's policy instead
+    preset: Mapped[str] = mapped_column(String(20), default="")
+    comment: Mapped[str] = mapped_column(String(500), default="")
+    created_by: Mapped[str] = mapped_column(String(320), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    __table_args__ = (UniqueConstraint("tenant_id", "version", name="uq_email_policy_version"),)
+
+
+class EmailContent(Base):
+    """A message's body, encrypted with the vault key, kept for flagged mail (or all mail, by policy) so technicians can
+    read it safely in the console. Deleted with its scan."""
+    __tablename__ = "email_content"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("emct"))
+    scan_id: Mapped[str] = mapped_column(String(32), unique=True)
+    tenant_id: Mapped[str] = mapped_column(String(32), index=True)
+    envelope: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class EmailModel(Base):
+    """One trained version of the email model (email_model.py): weights, how it scored on held-back messages, and
+    whether it is the one in use."""
+    __tablename__ = "email_models"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("emmod"))
+    version: Mapped[int] = mapped_column(Integer, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    samples: Mapped[int] = mapped_column(Integer, default=0)
+    positives: Mapped[int] = mapped_column(Integer, default=0)
+    labelled: Mapped[int] = mapped_column(Integer, default=0)
+    threshold: Mapped[float] = mapped_column(Float, default=0.8)
+    weights: Mapped[dict] = mapped_column(JSON, default=dict)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    active: Mapped[bool] = mapped_column(Boolean, default=False)
+    reason: Mapped[str] = mapped_column(String(400), default="")
+    trained_by: Mapped[str] = mapped_column(String(320), default="")
+
+
+class EmailGatewayDomain(Base):
+    """A customer domain whose mail comes through Fenrir's mail gateway (mail_gateway.py) before Microsoft 365."""
+    __tablename__ = "email_gateway_domains"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("emgw"))
+    tenant_id: Mapped[str] = mapped_column(String(32), index=True)
+    domain: Mapped[str] = mapped_column(String(255), unique=True)
+    # Where clean mail goes: the tenant's Microsoft 365 MX host, e.g. contoso-co-uk.mail.protection.outlook.com
+    destination: Mapped[str] = mapped_column(String(255))
+    destination_port: Mapped[int] = mapped_column(Integer, default=25)
+    require_tls: Mapped[bool] = mapped_column(Boolean, default=True)
+    reject_unknown_recipients: Mapped[bool] = mapped_column(Boolean, default=False)
+    tag_subject: Mapped[bool] = mapped_column(Boolean, default=False)  # "[Suspicious]" prefix (breaks DKIM without ARC)
+    actions: Mapped[dict] = mapped_column(JSON, default=dict)  # {"malware": "quarantine", "phish": "quarantine", "suspicious": "tag"}
+    notify: Mapped[dict] = mapped_column(JSON, default=dict)
+    retention_days: Mapped[int] = mapped_column(Integer, default=90)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    m365_connector: Mapped[dict] = mapped_column(JSON, default=dict)  # {"status", "lockdown", "at", "error"}
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(320), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class EmailQuarantine(Base):
+    """The original message the gateway held back, encrypted with the vault key, so it can be released later."""
+    __tablename__ = "email_quarantine"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("emq"))
+    scan_id: Mapped[str] = mapped_column(String(32), unique=True)
+    tenant_id: Mapped[str] = mapped_column(String(32), index=True)
+    mail_from: Mapped[str] = mapped_column(String(320), default="")
+    recipients: Mapped[list] = mapped_column(JSON, default=list)
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    envelope: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
 
 
 class M365Workflow(Base):
