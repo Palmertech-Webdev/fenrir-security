@@ -10,6 +10,14 @@ place, with no per-device licence fees.
 >
 > Fenrir is free, provided **as is**, with **no warranty and no support**. See [Licence](#licence).
 
+![The dashboard, with sample data](docs/images/dashboard.jpg)
+
+| An incident: correlated alerts, indicators and response | A device: health, risk, remote access and actions |
+|---|---|
+| ![Incident page](docs/images/incident.jpg) | ![Device page](docs/images/device.jpg) |
+
+<sub>Screenshots use the built-in sample data (`python -m fenrir_cloud.demo`); every name in them is made up.</sub>
+
 ## What it does
 
 | Area | What's included |
