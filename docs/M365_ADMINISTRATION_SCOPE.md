@@ -65,7 +65,7 @@ Users with the `m365_admin` permission can run changes. Viewing needs `configure
 ## Phase plan and exit
 
 This work is the Microsoft 365 phase in `parity/progress.md`. Each batch exits only when the owner has run
-[the test plan](M365_TEST_PLAN.md) on a real tenant and reported the results (AT-35). Remaining batches:
+the test plan on a real tenant and reported the results (AT-35). Remaining batches:
 
 3. Exchange: mailboxes, shared mailboxes, permissions, forwarding, aliases, distribution lists, mail rules, quarantine, message trace.
    This uses the Exchange Online admin interface, because Graph does not cover it.

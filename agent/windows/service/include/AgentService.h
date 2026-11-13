@@ -23,8 +23,10 @@
 #include "AdMonitor.h"
 #include "BruteForceGuard.h"
 #include "RegistryWatcher.h"
+#include "TemporaryAdmin.h"
 #include "CommandJournalStore.h"
 #include "DeviceInventoryCollector.h"
+#include "DnsProxy.h"
 #include "EventEnvelope.h"
 #include "FileDeltaTracker.h"
 #include "HardeningManager.h"
@@ -214,11 +216,21 @@ class AgentService {
   std::mutex elevationMutex_{};
   // Temporary admin passwords by request id: memory only, never written to disk or sent to the cloud.
   std::map<std::wstring, std::wstring> elevationPasswords_{};
+  // Programs the service started as a temporary administrator, by request id (guarded by elevationMutex_).
+  std::map<std::wstring, std::vector<std::shared_ptr<tempadmin::Launch>>> elevationLaunches_{};
+  // Starts target elevated on the user's desktop for this grant; endWhenClosed ends the grant once it has all closed.
+  bool StartElevatedProgram(const std::wstring& requestId, const std::wstring& sid, const std::wstring& account,
+                            const std::wstring& target, const std::wstring& arguments, bool endWhenClosed, std::wstring* error);
+  void WatchElevatedProgram(std::wstring requestId, std::shared_ptr<tempadmin::Launch> launch, bool endWhenClosed);
+  bool ElevatedProgramsRunningLocked(const std::wstring& requestId);
+  void ApplyElevationShellMenu(bool on);  // "Run as administrator with Fenrir" on programs and installers
+  int elevationMenuState_{-1};
   void CheckRemovableMedia();  // antimalware.scanRemovableMedia
   unsigned long knownDrives_{0};
   unsigned long pendingRemovable_{0};
   bool drivesPrimed_{false};
   void EnforceLocalAdminPolicy();  // privilege.removeLocalAdmins
+  void StartMemoryScan();          // edr.memoryScanning
   std::vector<std::wstring> LocalAdminKeepList(const std::wstring& payloadJson) const;
   std::wstring ExecuteInventoryUninstall(const RemoteCommand& command);
   unsigned long long lastLocalAdminCheck_{0};
@@ -228,6 +240,25 @@ class AgentService {
   int ScheduledScanCpuLimit() const;
   void FirewallWorker();
   bool RunFirewallScript(const std::string& script, const std::wstring& summary);
+  // Local DNS proxy (DnsProxy.h, policy dns.localProxy). The NRPT rule is applied on a worker thread; it is removed
+  // synchronously, before the proxy stops, so lookups never point at a proxy that is not running.
+  void ApplyDnsProxy();
+  void StopDnsProxy();
+  void RequestDnsRule(bool apply);
+  void DnsRuleWorker();
+  void SetDnsRuleNow(bool apply);  // caller holds dnsScriptMutex_
+  std::filesystem::path DnsMarkerPath() const;
+  std::filesystem::path DnsResolverUrlPath() const;
+  std::unique_ptr<dnsproxy::Proxy> dnsProxy_{};
+  std::string dnsProxyConfig_{};
+  std::string dnsSkipReported_{};
+  std::string dnsRuleFailureReported_{};
+  unsigned long long lastDnsRuleAttemptMs_{0};
+  std::atomic<int> dnsRuleWanted_{-1};  // 1 apply, 0 remove
+  std::mutex dnsRuleMutex_{};
+  std::mutex dnsScriptMutex_{};
+  bool dnsRuleBusy_{false};
+  std::thread dnsRuleThread_{};
   std::unique_ptr<LocalStateStore> stateStore_{};
   std::unique_ptr<ControlPlaneClient> controlPlaneClient_{};
   std::unique_ptr<CommandJournalStore> commandJournalStore_{};
@@ -275,6 +306,8 @@ class AgentService {
   void DrainDeferredTelemetry();
   std::thread::id mainThreadId_{};
   std::shared_ptr<std::atomic<bool>> backgroundScanBusy_{std::make_shared<std::atomic<bool>>(false)};
+  std::shared_ptr<std::atomic<bool>> memoryScanBusy_{std::make_shared<std::atomic<bool>>(false)};
+  unsigned long long lastMemoryScan_{0};
   std::shared_ptr<std::atomic<bool>> stopRequested_{std::make_shared<std::atomic<bool>>(false)};
   AgentState identitySnapshot_{};
   std::vector<DeferredTelemetry> deferredTelemetry_{};

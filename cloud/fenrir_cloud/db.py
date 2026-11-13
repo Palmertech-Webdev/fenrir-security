@@ -17,7 +17,7 @@ _session_factory: sessionmaker[Session] | None = None
 
 
 # The newest schema version this build creates. Bump it with every new migration below.
-LATEST_MIGRATION = 64
+LATEST_MIGRATION = 72
 
 def init_engine(url: str, pool_size: int = 5, max_overflow: int = 10) -> Engine:
     global _engine, _session_factory
@@ -474,6 +474,53 @@ def migrate(bind: Engine) -> list[int]:
                 IntelFeed.__table__.create(conn, checkfirst=True)  # free threat-intel feeds pulled by the server
                 conn.execute(text("INSERT INTO schema_migrations (version) VALUES (64)"))
                 applied.append(64)
+            if 65 not in versions:
+                from .models import EmailScan, EmailScanSetting
+                for model in (EmailScanSetting, EmailScan):  # email security: shadow-mode scanning of Microsoft 365 mail
+                    model.__table__.create(conn, checkfirst=True)
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (65)"))
+                applied.append(65)
+            if 66 not in versions:
+                from .models import EmailListEntry
+                EmailListEntry.__table__.create(conn, checkfirst=True)  # email security: allow and block lists
+                ensure_columns(Base, conn)  # protect mode: actions, release and notification fields
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (66)"))
+                applied.append(66)
+            if 67 not in versions:
+                from .models import EmailModel
+                EmailModel.__table__.create(conn, checkfirst=True)  # email security: the learned model's versions
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (67)"))
+                applied.append(67)
+            if 68 not in versions:
+                from .models import EmailGatewayDomain, EmailQuarantine
+                for model in (EmailGatewayDomain, EmailQuarantine):  # email security: the mail gateway
+                    model.__table__.create(conn, checkfirst=True)
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (68)"))
+                applied.append(68)
+            if 69 not in versions:
+                ensure_columns(Base, conn)  # email_scans.details: headers, path, origin and other evidence
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (69)"))
+                applied.append(69)
+            if 70 not in versions:
+                from .models import EmailContent, EmailPolicyVersion
+                for model in (EmailPolicyVersion, EmailContent):  # email policies (versioned) and kept message bodies
+                    model.__table__.create(conn, checkfirst=True)
+                ensure_columns(Base, conn)  # email_list_entries: expiry and hit counts
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (70)"))
+                applied.append(70)
+            if 71 not in versions:
+                from .models import DnsDeviceDay, DnsRule, DnsRuleChange, DnsRuleset
+                for model in (DnsRule, DnsRuleChange, DnsRuleset, DnsDeviceDay):  # DNS rules, history, Fenrir ruleset, per-device counts
+                    model.__table__.create(conn, checkfirst=True)
+                ensure_columns(Base, conn)  # dns_query_log: source, rule_id, score
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (71)"))
+                applied.append(71)
+            if 72 not in versions:
+                from .models import ElevationAllowance
+                ElevationAllowance.__table__.create(conn, checkfirst=True)  # PAM: admin access without asking each time
+                ensure_columns(Base, conn)  # elevation_requests: publisher, sha256, approved_by_rule
+                conn.execute(text("INSERT INTO schema_migrations (version) VALUES (72)"))
+                applied.append(72)
             conn.commit()
         except Exception:
             conn.rollback()

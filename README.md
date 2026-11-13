@@ -5,7 +5,8 @@ management (RMM), Microsoft 365 administration, vulnerability management and day
 place, with no per-device licence fees.
 
 > **This repository is a fixed snapshot.** It shows the platform as it runs in production and doesn't accept changes.
-> To build on it, click **Use this template** (or fork it) and make the copy your own.
+> To build on it, click **Use this template** (or fork it) and make the copy your own, then install from **your copy**:
+> servers take their updates from the repository they were installed from. [FORKING.md](FORKING.md) is the checklist.
 >
 > Fenrir is free, provided **as is**, with **no warranty and no support**. See [Licence](#licence).
 
@@ -13,7 +14,9 @@ place, with no per-device licence fees.
 
 | Area | What's included |
 |---|---|
-| Endpoint security | Windows, macOS, Linux and Android agents; detection rules and a malware model; alerts, incidents, quarantine and response; DNS and web protection; free threat feeds (abuse.ch, IPsum). |
+| Endpoint security | Windows, macOS, Linux and Android agents; detection rules and a malware model; memory, archive and PUA scanning; ransomware shield with deception files; exploit protection; a Windows file-system minifilter for pre-execution blocking; alerts, incidents, quarantine and response; free threat feeds (abuse.ch, IPsum). |
+| DNS and email protection | Per-device encrypted DNS filtering (Windows and Linux local proxy, Android Private DNS) with rules, block lists and a scored ruleset; Microsoft 365 email scanning with policies, quarantine, forensics and an optional SMTP gateway. |
+| Privileged access | Temporary admin access on Windows without sharing passwords: approved programs open already elevated, technicians can allow users without approval, policies can auto-approve users, programs and publishers; LAPS and break-glass accounts. |
 | RMM | Inventory, monitoring, scripts and a categorised script library, patching, software deployment, terminal, files, and browser-based remote control (direct peer-to-peer, with a relay fallback). |
 | Microsoft 365 | Every customer tenant in one view: users, MFA, groups, guests, sign-in and audit logs, onboarding and offboarding, Exchange, Teams, SharePoint, Intune, security standards and scheduled reports. |
 | Exposure | Vulnerability inventory with CVE, EPSS and KEV data, device risk scores and remediation tracking. |
@@ -62,8 +65,11 @@ The console is then at `http://localhost:8080`. Windows installers built this wa
 
 ## Guides
 
+- **Making it yours:** [forking checklist](FORKING.md), [outside services and what they receive](docs/SUBPROCESSORS.md).
 - **Running it:** [go-live checklist](docs/GO_LIVE.md), [code signing](docs/CODE_SIGNING.md),
-  [updates](docs/AUTO_UPDATE.md), [backup and restore](docs/BACKUP_AND_RESTORE.md).
+  [driver signing](docs/DRIVER_SIGNING.md), [updates](docs/AUTO_UPDATE.md), [backup and restore](docs/BACKUP_AND_RESTORE.md).
+- **Protection:** [DNS protection](docs/DNS_PROTECTION.md), [email security](docs/EMAIL_SECURITY.md) and its
+  [setup guide](docs/EMAIL_SECURITY_SETUP.md).
 - **Agents:** [deploy from your RMM, Group Policy or Intune](docs/DEPLOY_FROM_YOUR_RMM.md),
   [installing on macOS](docs/MACOS_INSTALL.md), [iPhone and iPad web protection](docs/APPLE_WEB_PROTECTION.md),
   [Windows agent persistence](docs/WINDOWS_AGENT_PERSISTENCE.md), [Windows patching](docs/WINDOWS_PATCHING.md).
@@ -75,7 +81,9 @@ The console is then at `http://localhost:8080`. Windows installers built this wa
 
 ## Limits
 
-- Windows protection runs in user mode. The kernel driver and pre-execution blocking are not included.
+- The Windows minifilter (pre-execution blocking) is included as source and an unsigned build. Windows only loads it on
+  machines with test signing on, or once you have it attestation-signed by Microsoft
+  ([driver signing](docs/DRIVER_SIGNING.md)); without it, protection runs in user mode.
 - Code that exists here is not proof that a feature has been independently tested on real devices. Test it on your
   own systems before you rely on it.
 - Hosting, a domain, publicly trusted code signing and some optional providers can still cost money.

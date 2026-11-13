@@ -120,6 +120,10 @@ else
   git clone -q ${branch:+--branch "$branch"} "$repo" "$dir"
   root="$dir"; ok "cloned into $root"
 fi
+# Automatic updates come from this repository's releases: it should be your own copy (see FORKING.md).
+update_source="$(git -C "$root" remote get-url origin 2>/dev/null || echo "none")"
+ok "updates will come from: $update_source"
+printf '         Make sure that is your own fork or template copy: whoever controls it controls this server.\n'
 cd "$root"
 umask 022
 
@@ -146,6 +150,8 @@ else
   set_env FENRIR_PUBLIC_URL "https://$domain"
   set_env FENRIR_DOMAIN "$domain"
   set_env FENRIR_OPEN_ENROLLMENT false
+  set_env FENRIR_BACKUP_PASSPHRASE "$(openssl rand -base64 32)"  # backup.sh encrypts with it; keep it offline with .env
+  set_env FENRIR_TRUSTED_PROXIES "172.16.0.0/12,10.0.0.0/8,192.168.0.0/16,127.0.0.1"  # Caddy on the Docker network
   set_env FENRIR_BUILD_PROFILE production
   set_env FENRIR_RELEASE_KEY ./signing/release-ed25519.pem
   set_env FENRIR_MSP_NAME "$company"

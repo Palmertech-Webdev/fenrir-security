@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import mimetypes
 import secrets
 import re
@@ -13,7 +14,7 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from sqlalchemy import delete, func, select, text
@@ -26,10 +27,9 @@ from .config import Settings, get_settings, set_settings
 from .detection import sync_builtin_rules
 from .models import Device, DnsQueryLog, Event, RateLimitBucket, Policy, RuleMatch, Tenant, User, utcnow
 from .routers import m365_admin as m365_admin_router
-from .routers import m365 as m365_router, network as network_router, grc as grc_router, backup as backup_router, soc_workflows
+from .routers import m365 as m365_router, network as network_router, grc as grc_router, soc_workflows
 from .routers import documentation as documentation_router
 from .routers import push as push_router
-from .routers import care as care_router
 from .routers import active_directory as ad_router
 from .routers import agent_health as agent_health_router
 from .routers import onboarding as onboarding_router
@@ -47,6 +47,9 @@ from .routers import exclusions as exclusions_router
 from .routers import exposure_intel as exposure_intel_router
 from .routers import m365_partner as m365_partner_router
 from .routers import m365_workspace as m365_workspace_router
+from .routers import email_security as email_security_router
+from .routers import email_policies as email_policies_router
+from .routers import dns_console as dns_console_router
 from .routers import m365_lifecycle as m365_lifecycle_router
 from .routers import condition_packages as condition_packages_router
 from .routers import triage as triage_router
@@ -70,6 +73,14 @@ from .services import GLOBAL_POLICY_ID
 mimetypes.add_type("application/manifest+json", ".webmanifest")
 
 log = logging.getLogger("fenrir")
+
+# Pages served as HTML (the console and the few public pages): scripts only from this server, no plugins, no
+# framing, forms only back here. Styles allow inline (React style props and the email viewer); images and map tiles
+# may come from https; WebSockets serve the realtime and remote-session channels.
+CONSOLE_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; "
+               "font-src 'self' data:; connect-src 'self' ws: wss:; media-src 'self' blob:; worker-src 'self'; "
+               "manifest-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; "
+               "frame-ancestors 'none'")
 
 
 def bootstrap(settings: Settings) -> None:
@@ -230,6 +241,9 @@ def _purge_telemetry(db, settings: Settings) -> dict:
             ~exists().where(RuleMatch.event_pk == Event.id))
     removed["ruleMatches"] = _delete_in_chunks(db, RuleMatch, RuleMatch.at < cutoff)
     removed["dnsQueries"] = _delete_in_chunks(db, DnsQueryLog, DnsQueryLog.at < cutoff)
+    from .models import DnsDeviceDay
+
+    removed["dnsDays"] = _delete_in_chunks(db, DnsDeviceDay, DnsDeviceDay.day < (now - timedelta(days=400)).strftime("%Y-%m-%d"))
     db.execute(delete(RateLimitBucket).where(RateLimitBucket.expires_at < utcnow()))
     if any(removed.values()):
         log.info("telemetry retention removed %s", removed)
@@ -260,6 +274,9 @@ def _maintenance_jobs(settings: Settings) -> list[tuple[str, object]]:
         from . import blocklists
 
         jobs.append(("dns.blocklists", lambda db: [log.info("dns blocklist sync: %s", r) for r in blocklists.sync_due(db)]))
+        from . import dns_ruleset
+
+        jobs.append(("dns.ruleset", dns_ruleset.tick))  # rebuild the Fenrir DNS ruleset after the feeds change
     return jobs
 
 
@@ -317,17 +334,10 @@ def _poll_msp_mailbox(db) -> None:
         psa.poll_imap(db, msp.id)
 
 
-def _care_tick(db) -> None:
-    from . import care
-
-    care.tick(db)
-
-
 def _scheduled_jobs() -> list[tuple[str, int, object]]:
     """(name, every N passes of 30 seconds, job), in the order they run within a pass."""
     from . import condition_remediation, m365_lifecycle, m365_signin_security, network, remediation, topology
     from .routers import artifacts as artifact_store
-    from .routers import backup as backup_health
 
     return [
         ("rmm", 1, rmm.tick),
@@ -340,14 +350,12 @@ def _scheduled_jobs() -> list[tuple[str, int, object]]:
         ("network", 1, network.tick),
         ("psa.mailbox", 4, _poll_msp_mailbox),  # every two minutes
         ("condition-remediation", 10, condition_remediation.tick),  # every five minutes
-        ("backup.health", 10, backup_health.health_tick),
         ("remediation", 20, remediation.tick),  # every ten minutes
         ("remediation.verify", 20, remediation.verify_tick),  # rescans after fixes; reports fixes not confirmed in a day
         ("topology", 120, topology.tick),  # hourly
         ("artifacts.purge", 120, artifact_store.purge_expired),
         ("audit.checkpoint", 120, audit.daily_checkpoint),  # CORE-06: daily chain-head checkpoint (published to webhooks)
         ("audit.retention", 120, audit.apply_retention),
-        ("care", 2, _care_tick),  # looked-after phones: gone quiet, unacknowledged alerts (every minute)
     ]
 
 
@@ -374,7 +382,8 @@ def _scheduler_loop(stop: threading.Event, interval: float = 30.0) -> None:
 
 
 def start_background(settings: Settings, stop: threading.Event) -> list[threading.Thread]:
-    """Starts the background loops: hourly maintenance, the 30-second scheduler and vulnerability intel. The web
+    """Starts the background loops: hourly maintenance, the 30-second scheduler, vulnerability intel and email
+    security scanning. The web
     process runs them itself (FENRIR_ROLE=all) or leaves them to ``python -m fenrir_cloud.worker`` (web/worker)."""
     threads = [threading.Thread(target=_maintenance_loop, args=(settings, stop), daemon=True, name="maintenance")]
     if settings.scheduler_enabled:
@@ -383,6 +392,10 @@ def start_background(settings: Settings, stop: threading.Event) -> list[threadin
         from . import cveintel
 
         threads.append(threading.Thread(target=cveintel.loop, args=(stop,), daemon=True, name="vuln-intel"))
+    if settings.scheduler_enabled:
+        from . import email_scan
+
+        threads.append(threading.Thread(target=email_scan.loop, args=(stop,), daemon=True, name="email-security"))
     for thread in threads:
         thread.start()
     return threads
@@ -558,6 +571,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         from .demo_mode import DemoGuard
 
         app.add_middleware(DemoGuard, seed_token=settings.demo_seed_token)
+    from . import proxies
+
+    trusted_proxies = proxies.parse(settings.trusted_proxies)
+    if trusted_proxies:  # outermost: everything after it sees the real client address
+        app.add_middleware(proxies.TrustedProxyMiddleware, networks=trusted_proxies)
+
+    https_public = settings.public_base_url.lower().startswith("https://")
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -567,6 +587,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # The remote viewer needs the clipboard and fullscreen; nothing else may use powerful features.
         response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
+        if https_public:
+            # Browsers that have seen the console over HTTPS never go back to plain HTTP for it (a year).
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+        if response.headers.get("content-type", "").startswith("text/html") and \
+                not request.url.path.startswith(("/docs", "/redoc", "/legacy/")):  # FastAPI's API pages load their own scripts
+            response.headers.setdefault("Content-Security-Policy", CONSOLE_CSP)
         return response
 
     from . import approvals as approval_gate
@@ -579,17 +605,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     for module in (agent_api, admin, fleet, soc, crm_router, business, rmm_router, service_mgmt, psa_router, remote_router, portal):
         app.include_router(module.router)
     app.include_router(onboarding_router.workspace_router)
-    for module in (m365_admin_router, m365_router, network_router, grc_router, backup_router, soc_workflows, ad_router, agent_health_router, onboarding_router, m365_exchange_router, m365_signin_router, m365_intune_router, m365_reports_router, m365_collaboration_router, grc_programme_router,
+    for module in (m365_admin_router, m365_router, network_router, grc_router, soc_workflows, ad_router, agent_health_router, onboarding_router, m365_exchange_router, m365_signin_router, m365_intune_router, m365_reports_router, m365_collaboration_router, grc_programme_router,
                    rollouts_router, apikeys_router, roles_router, approvals_router, exclusions_router,
-                   exposure_intel_router, m365_partner_router, m365_workspace_router, m365_lifecycle_router, condition_packages_router, triage_router, clients_router, search_router, defender_router, mobile_apps_router, push_router, care_router,
+                   exposure_intel_router, m365_partner_router, m365_workspace_router, email_security_router, email_policies_router, dns_console_router, m365_lifecycle_router, condition_packages_router, triage_router, clients_router, search_router, defender_router, mobile_apps_router, push_router,
                    reports_router, branding_router, deploy_router):
         app.include_router(module.router)
     app.include_router(deploy_router.public)
+    app.include_router(email_security_router.public)
     app.include_router(documentation_router.router)
     app.include_router(m365_router.oauth)
     app.include_router(psa_router.inbound)
     app.include_router(business.xero_callback)
-    app.include_router(backup_router.ingest)
     from .routers import local_admin as local_admin_router
     app.include_router(local_admin_router.agent)
     app.include_router(local_admin_router.console)
@@ -604,6 +630,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from .routers import elevation as elevation_router
     app.include_router(elevation_router.agent)
     app.include_router(elevation_router.console)
+    app.include_router(elevation_router.allowances)
     app.include_router(artifacts_router.agent)
     app.include_router(artifacts_router.console)
     app.include_router(remote_router.sockets)
@@ -714,6 +741,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     if settings.enable_legacy:
         _mount_legacy(app)
+
+    @app.get("/.well-known/security.txt", include_in_schema=False)
+    def security_txt():
+        """RFC 9116: how to report a vulnerability in this server. Only when FENRIR_SECURITY_CONTACT is set (a mailto: or
+        https: address), so no contact is published by accident."""
+        contact = os.getenv("FENRIR_SECURITY_CONTACT", "").strip()
+        if not contact.startswith(("mailto:", "https://")):
+            raise HTTPException(404, "Not found")
+        from datetime import timedelta
+
+        expires = (utcnow() + timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        lines = [f"Contact: {contact}", f"Expires: {expires}", "Preferred-Languages: en",
+                 f"Canonical: {settings.public_base_url.rstrip('/')}/.well-known/security.txt"]
+        policy = os.getenv("FENRIR_SECURITY_POLICY_URL", "").strip()
+        if policy.startswith("https://"):
+            lines.append(f"Policy: {policy}")
+        return PlainTextResponse("\n".join(lines) + "\n")
 
     console_dir = settings.console_dir
     if console_dir.is_dir() and (console_dir / "index.html").is_file():

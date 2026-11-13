@@ -9,6 +9,7 @@ Linux agent's reputation lookup. Device calls authenticate with the
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import secrets
@@ -268,14 +269,12 @@ def heartbeat(body: dict = Body(default={}), device: Device = Depends(current_de
     device.metrics = {**(device.metrics or {}), "commandCancellation": body.get("commandCancellation") is True}
     _sync_cmdb_from_agent(db, device)
     resolution, policy_doc = services.effective_policy(db, device)
+    if device.platform == "android":
+        _android_private_dns(policy_doc, device)
     if device.platform == "android" and isinstance(body.get("metrics"), dict):
         from .. import android_compliance
 
         android_compliance.record(db, device, body["metrics"], resolution["settings"])
-    if device.platform == "android":
-        from .. import care
-
-        care.on_heartbeat(db, device, body.get("metrics"))
     pending = db.execute(select(func.count()).where(Command.device_id == device.id, Command.status == "pending")).scalar() or 0
     db.commit()
     reply = {"receivedAt": _iso(utcnow()), "effectivePolicyRevision": policy_doc["revision"], "commandsPending": pending,
@@ -288,9 +287,8 @@ def heartbeat(body: dict = Body(default={}), device: Device = Depends(current_de
         from .. import geofence
 
         reply["geofences"] = geofence.for_phone(db, device)  # safe zones: proximity alerts and faster location checks
-        from .. import care
-
-        reply["tracking"] = care.tracking_reply(device)  # how often to report location (care level, SOS)
+        # How often the phone reports its location: its own pace (15 minutes, 5 near safe zones).
+        reply["tracking"] = {"mode": "default", "intervalSeconds": 900, "adaptive": False, "sos": False}
     return reply
 
 
@@ -324,13 +322,36 @@ def support_request(body: dict = Body(default={}), device: Device = Depends(curr
     return {"ticketId": ticket.id, "number": ticket.number}
 
 
+def _android_private_dns(policy_doc: dict, device: Device) -> None:
+    """Tells a phone which Private DNS hostname to use (and how to prove which phone it is) when its policy asks for it."""
+    android = (policy_doc.get("modules") or {}).get("android")
+    if not isinstance(android, dict):
+        return
+    hostname = get_settings().dot_hostname
+    if android.get("privateDns") == "fenrir" and hostname:
+        android["privateDnsHost"] = hostname
+        from ..dot_server import probe_name
+
+        android["privateDnsProbe"] = probe_name(device)
+        # Part of the revision, so phones fetch the policy again when the server's DNS-over-TLS hostname changes.
+        policy_doc["revision"] = hashlib.sha256(f"{policy_doc['revision']}|dot|{hostname}".encode()).hexdigest()[:16]
+    else:
+        android.pop("privateDnsHost", None)
+        android.pop("privateDnsProbe", None)
+
+
 @router.post("/devices/{device_id}/policy-check-in")
 def policy_check_in(body: dict = Body(default={}), device: Device = Depends(current_device), db: Session = Depends(get_db)):
     _, policy_doc = services.effective_policy(db, device)
+    if device.platform == "android":
+        _android_private_dns(policy_doc, device)
     changed = body.get("currentPolicyRevision") != policy_doc["revision"]
     device.applied_policy_revision = policy_doc["revision"]
     db.commit()
-    return {"retrievedAt": _iso(utcnow()), "changed": changed, "policy": policy_doc}
+    base = get_settings().public_base_url.rstrip("/")
+    # Agents enrolled before they used it learn their DNS resolver address here (the Windows local DNS proxy).
+    return {"retrievedAt": _iso(utcnow()), "changed": changed, "policy": policy_doc,
+            "dnsOverHttpsUrl": f"{base}/dns/{device.dns_token}/dns-query"}
 
 
 async def _lenient_json(request: Request) -> dict:
